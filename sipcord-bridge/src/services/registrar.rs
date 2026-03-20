@@ -46,6 +46,12 @@ pub struct Registrar {
     discord_to_sip: DashMap<String, String>,
 }
 
+impl Default for Registrar {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Registrar {
     pub fn new() -> Self {
         Self {
@@ -68,10 +74,10 @@ impl Registrar {
             .find(|r| r.source_addr == reg.source_addr && r.contact_uri == reg.contact_uri)
         {
             // If discord_username changed, remove the old reverse mapping
-            if existing.discord_username != reg.discord_username {
-                if let Some(ref old_du) = existing.discord_username {
-                    self.discord_to_sip.remove(old_du);
-                }
+            if existing.discord_username != reg.discord_username
+                && let Some(ref old_du) = existing.discord_username
+            {
+                self.discord_to_sip.remove(old_du);
             }
 
             existing.expires_at = reg.expires_at;

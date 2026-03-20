@@ -7,7 +7,7 @@
 //! cmake build (used in Docker to separate the slow C build into its own layer).
 
 use std::env;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 fn main() {
@@ -214,7 +214,7 @@ fn main() {
 }
 
 /// Build pjproject from source and return include paths.
-fn build_from_source(out_dir: &PathBuf) -> Vec<PathBuf> {
+fn build_from_source(out_dir: &Path) -> Vec<PathBuf> {
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
     let pjproject_src = manifest_dir.join("pjproject");
 

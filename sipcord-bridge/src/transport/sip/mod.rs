@@ -539,10 +539,9 @@ fn make_outbound_call(sip_uri: &str, caller_display_name: Option<&str>) -> Resul
                 == ::pjsua::pj_constants__PJ_SUCCESS as i32
             {
                 let ai = acc_info.assume_init();
-                let uri_str = std::ffi::CStr::from_ptr(ai.acc_uri.ptr)
+                std::ffi::CStr::from_ptr(ai.acc_uri.ptr)
                     .to_string_lossy()
-                    .into_owned();
-                uri_str
+                    .into_owned()
             } else {
                 "sip:sipcord@localhost".to_string()
             };

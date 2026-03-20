@@ -256,44 +256,50 @@ unsafe extern "C" fn fax_port_get_frame(
         return pj_constants__PJ_SUCCESS as pj_status_t;
     }
 
-    let call_id_ldata = (*this_port).port_data.ldata;
+    let call_id_ldata = unsafe { (*this_port).port_data.ldata };
 
-    if let Some(consumer_entry) = get_fax_tx_consumers().get(&call_id_ldata) {
-        if let Some(mut consumer) = consumer_entry.try_lock() {
-            let available = consumer.slots();
-            if available >= SAMPLES_PER_FRAME {
-                if let Ok(chunk) = consumer.read_chunk(SAMPLES_PER_FRAME) {
-                    let (first, second) = chunk.as_slices();
-                    let buf = (*frame).buf as *mut i16;
-                    let out = std::slice::from_raw_parts_mut(buf, SAMPLES_PER_FRAME);
-                    out[..first.len()].copy_from_slice(first);
-                    if !second.is_empty() {
-                        out[first.len()..first.len() + second.len()].copy_from_slice(second);
-                    }
-                    chunk.commit_all();
-                    (*frame).type_ = pjmedia_frame_type_PJMEDIA_FRAME_TYPE_AUDIO;
-                    (*frame).size = SAMPLES_PER_FRAME * 2;
-                    return pj_constants__PJ_SUCCESS as pj_status_t;
-                }
+    if let Some(consumer_entry) = get_fax_tx_consumers().get(&call_id_ldata)
+        && let Some(mut consumer) = consumer_entry.try_lock()
+    {
+        let available = consumer.slots();
+        if available >= SAMPLES_PER_FRAME
+            && let Ok(chunk) = consumer.read_chunk(SAMPLES_PER_FRAME)
+        {
+            let (first, second) = chunk.as_slices();
+            let out = unsafe {
+                let buf = (*frame).buf as *mut i16;
+                std::slice::from_raw_parts_mut(buf, SAMPLES_PER_FRAME)
+            };
+            out[..first.len()].copy_from_slice(first);
+            if !second.is_empty() {
+                out[first.len()..first.len() + second.len()].copy_from_slice(second);
             }
+            chunk.commit_all();
+            unsafe {
+                (*frame).type_ = pjmedia_frame_type_PJMEDIA_FRAME_TYPE_AUDIO;
+                (*frame).size = SAMPLES_PER_FRAME * 2;
+            }
+            return pj_constants__PJ_SUCCESS as pj_status_t;
         }
     }
 
     // No TX audio available — return silence audio frame (not NONE).
     // Returning FRAME_TYPE_NONE can cause PJSIP's conference bridge to
     // exclude this port from the audio mix, breaking the TX path.
-    let buf = (*frame).buf as *mut i16;
-    let out = std::slice::from_raw_parts_mut(buf, SAMPLES_PER_FRAME);
-    out.fill(0);
-    (*frame).type_ = pjmedia_frame_type_PJMEDIA_FRAME_TYPE_AUDIO;
-    (*frame).size = SAMPLES_PER_FRAME * 2;
+    unsafe {
+        let buf = (*frame).buf as *mut i16;
+        let out = std::slice::from_raw_parts_mut(buf, SAMPLES_PER_FRAME);
+        out.fill(0);
+        (*frame).type_ = pjmedia_frame_type_PJMEDIA_FRAME_TYPE_AUDIO;
+        (*frame).size = SAMPLES_PER_FRAME * 2;
+    }
     pj_constants__PJ_SUCCESS as pj_status_t
 }
 
 /// on_destroy callback — no-op since cleanup is done in remove_fax_audio_port().
 /// Required by PJSIP to avoid "on_destroy() not found" warning.
 unsafe extern "C" fn fax_port_on_destroy(_this_port: *mut pjmedia_port) -> pj_status_t {
-    pj_constants__PJ_SUCCESS as pj_status_t
+    pj_constants__PJ_SUCCESS as pj_status_t // no unsafe ops needed
 }
 
 /// put_frame callback — captures SIP audio and pushes to RX ring buffer for SpanDSP.
@@ -306,36 +312,40 @@ unsafe extern "C" fn fax_port_put_frame(
     }
 
     // Only process audio frames with data
-    if (*frame).type_ != pjmedia_frame_type_PJMEDIA_FRAME_TYPE_AUDIO || (*frame).size == 0 {
+    if unsafe {
+        (*frame).type_ != pjmedia_frame_type_PJMEDIA_FRAME_TYPE_AUDIO || (*frame).size == 0
+    } {
         return pj_constants__PJ_SUCCESS as pj_status_t;
     }
 
-    let call_id_ldata = (*this_port).port_data.ldata;
+    let call_id_ldata = unsafe { (*this_port).port_data.ldata };
 
     // View frame buffer as i16 slice
-    let num_samples = (*frame).size / 2;
-    let frame_buf = (*frame).buf as *const i16;
-    let samples = std::slice::from_raw_parts(frame_buf, num_samples);
+    let samples = unsafe {
+        let num_samples = (*frame).size / 2;
+        let frame_buf = (*frame).buf as *const i16;
+        std::slice::from_raw_parts(frame_buf, num_samples)
+    };
 
     // Push to RX ring buffer
-    if let Some(producer_entry) = get_fax_rx_producers().get(&call_id_ldata) {
-        if let Some(mut producer) = producer_entry.try_lock() {
-            let available = producer.slots();
-            if available >= samples.len() {
-                if let Ok(mut chunk) = producer.write_chunk(samples.len()) {
-                    let (first, second) = chunk.as_mut_slices();
-                    let first_len = first.len().min(samples.len());
-                    first[..first_len].copy_from_slice(&samples[..first_len]);
-                    if first_len < samples.len() {
-                        second[..samples.len() - first_len].copy_from_slice(&samples[first_len..]);
-                    }
-                    chunk.commit_all();
+    if let Some(producer_entry) = get_fax_rx_producers().get(&call_id_ldata)
+        && let Some(mut producer) = producer_entry.try_lock()
+    {
+        let available = producer.slots();
+        if available >= samples.len() {
+            if let Ok(mut chunk) = producer.write_chunk(samples.len()) {
+                let (first, second) = chunk.as_mut_slices();
+                let first_len = first.len().min(samples.len());
+                first[..first_len].copy_from_slice(&samples[..first_len]);
+                if first_len < samples.len() {
+                    second[..samples.len() - first_len].copy_from_slice(&samples[first_len..]);
                 }
-            } else {
-                // Buffer full — fax processing is falling behind. Track the drop.
-                if let Some(counter) = get_fax_rx_drop_counts().get(&call_id_ldata) {
-                    counter.fetch_add(1, Ordering::Relaxed);
-                }
+                chunk.commit_all();
+            }
+        } else {
+            // Buffer full — fax processing is falling behind. Track the drop.
+            if let Some(counter) = get_fax_rx_drop_counts().get(&call_id_ldata) {
+                counter.fetch_add(1, Ordering::Relaxed);
             }
         }
     }

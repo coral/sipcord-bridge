@@ -161,7 +161,7 @@ unsafe extern "C" fn pjsip_log_callback(level: c_int, data: *const c_char, _len:
         return;
     }
 
-    let c_str = std::ffi::CStr::from_ptr(data);
+    let c_str = unsafe { std::ffi::CStr::from_ptr(data) };
     let msg = c_str.to_string_lossy();
     let msg = msg.trim_end();
 
@@ -375,10 +375,10 @@ pub fn init_pjsua(config: &SipConfig, tls_config: Option<&TlsConfig>) -> Result<
         tracing::info!("TCP transport created on port {}", config.port);
 
         // Create TLS transport if configured (skip gracefully if certs missing)
-        if let Some(tls) = tls_config {
-            if !create_tls_transport(tls, &config.public_host)? {
-                tracing::warn!("TLS transport not created - running without TLS");
-            }
+        if let Some(tls) = tls_config
+            && !create_tls_transport(tls, &config.public_host)?
+        {
+            tracing::warn!("TLS transport not created - running without TLS");
         }
 
         // Start pjsua

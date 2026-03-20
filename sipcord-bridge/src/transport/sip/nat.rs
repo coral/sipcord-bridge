@@ -79,12 +79,11 @@ fn sanitize_sdp_missing_rtpmap(sdp: &str) -> Option<String> {
         let mut rtpmap_pts: std::collections::HashSet<u32> = std::collections::HashSet::new();
         for line in section_lines {
             // a=rtpmap:96 opus/48000/2
-            if let Some(rest) = line.strip_prefix("a=rtpmap:") {
-                if let Some(pt_str) = rest.split_whitespace().next() {
-                    if let Ok(pt) = pt_str.parse::<u32>() {
-                        rtpmap_pts.insert(pt);
-                    }
-                }
+            if let Some(rest) = line.strip_prefix("a=rtpmap:")
+                && let Some(pt_str) = rest.split_whitespace().next()
+                && let Ok(pt) = pt_str.parse::<u32>()
+            {
+                rtpmap_pts.insert(pt);
             }
         }
 
@@ -94,11 +93,12 @@ fn sanitize_sdp_missing_rtpmap(sdp: &str) -> Option<String> {
         let mut stripped_pts: Vec<u32> = Vec::new();
 
         for pt_str in payload_types {
-            if let Ok(pt) = pt_str.parse::<u32>() {
-                if pt >= 96 && !rtpmap_pts.contains(&pt) {
-                    stripped_pts.push(pt);
-                    continue;
-                }
+            if let Ok(pt) = pt_str.parse::<u32>()
+                && pt >= 96
+                && !rtpmap_pts.contains(&pt)
+            {
+                stripped_pts.push(pt);
+                continue;
             }
             kept_pts.push(pt_str);
         }
@@ -134,14 +134,12 @@ fn sanitize_sdp_missing_rtpmap(sdp: &str) -> Option<String> {
         // Copy section attribute lines, stripping a=fmtp: for removed PTs
         let stripped_set: std::collections::HashSet<u32> = stripped_pts.into_iter().collect();
         for line in section_lines {
-            if let Some(rest) = line.strip_prefix("a=fmtp:") {
-                if let Some(pt_str) = rest.split_whitespace().next() {
-                    if let Ok(pt) = pt_str.parse::<u32>() {
-                        if stripped_set.contains(&pt) {
-                            continue; // skip fmtp for stripped PT
-                        }
-                    }
-                }
+            if let Some(rest) = line.strip_prefix("a=fmtp:")
+                && let Some(pt_str) = rest.split_whitespace().next()
+                && let Ok(pt) = pt_str.parse::<u32>()
+                && stripped_set.contains(&pt)
+            {
+                continue; // skip fmtp for stripped PT
             }
             result_lines.push(line.to_string());
         }
@@ -164,14 +162,14 @@ fn is_rfc1918(ip: Ipv4Addr) -> bool {
 ///
 /// Returns `None` if transport info is invalid or the address is not IPv4.
 unsafe fn extract_dst_ipv4(tdata: *const pjsip_tx_data) -> Option<Ipv4Addr> {
-    if (*tdata).tp_info.transport.is_null() || (*tdata).tp_info.dst_addr_len <= 0 {
+    if unsafe { (*tdata).tp_info.transport.is_null() || (*tdata).tp_info.dst_addr_len <= 0 } {
         return None;
     }
 
-    let dst_addr = &(*tdata).tp_info.dst_addr;
+    let dst_addr = unsafe { &(*tdata).tp_info.dst_addr };
     // PJ_AF_INET is typically 2 (same as AF_INET on most systems)
-    if dst_addr.addr.sa_family == 2 {
-        let addr_in = &dst_addr.ipv4;
+    if unsafe { dst_addr.addr.sa_family } == 2 {
+        let addr_in = unsafe { &dst_addr.ipv4 };
         let ip_bytes = addr_in.sin_addr.s_addr.to_ne_bytes();
         Some(Ipv4Addr::new(
             ip_bytes[0],
@@ -195,32 +193,33 @@ unsafe fn rewrite_contact_host(
     new_host: &str,
     new_port: u16,
 ) -> bool {
-    let contact_hdr = pjsip_msg_find_hdr(msg, pjsip_hdr_e_PJSIP_H_CONTACT, ptr::null_mut())
-        as *mut pjsip_contact_hdr;
+    let contact_hdr =
+        unsafe { pjsip_msg_find_hdr(msg, pjsip_hdr_e_PJSIP_H_CONTACT, ptr::null_mut()) }
+            as *mut pjsip_contact_hdr;
     if contact_hdr.is_null() {
         return false;
     }
 
-    let uri = (*contact_hdr).uri;
+    let uri = unsafe { (*contact_hdr).uri };
     if uri.is_null() {
         return false;
     }
 
     // Unwrap via vtable to handle pjsip_name_addr wrapping
-    let uri_vptr = (*(uri as *const pjsip_uri)).vptr;
+    let uri_vptr = unsafe { (*(uri as *const pjsip_uri)).vptr };
     if uri_vptr.is_null() {
         return false;
     }
-    let get_uri_fn = match (*uri_vptr).p_get_uri {
+    let get_uri_fn = match unsafe { (*uri_vptr).p_get_uri } {
         Some(f) => f,
         None => return false,
     };
-    let sip_uri_raw = get_uri_fn(uri as *mut std::os::raw::c_void);
+    let sip_uri_raw = unsafe { get_uri_fn(uri as *mut std::os::raw::c_void) };
     if sip_uri_raw.is_null() {
         return false;
     }
     let sip_uri = sip_uri_raw as *mut pjsip_sip_uri;
-    if (*sip_uri).host.ptr.is_null() || (*sip_uri).host.slen <= 0 {
+    if unsafe { (*sip_uri).host.ptr.is_null() || (*sip_uri).host.slen <= 0 } {
         return false;
     }
 
@@ -228,15 +227,17 @@ unsafe fn rewrite_contact_host(
         return false;
     };
     let host_len = new_host.len();
-    let pool_str = pj_pool_alloc(pool, host_len + 1) as *mut c_char;
+    let pool_str = unsafe { pj_pool_alloc(pool, host_len + 1) } as *mut c_char;
     if pool_str.is_null() {
         return false;
     }
 
-    ptr::copy_nonoverlapping(host_cstr.as_ptr(), pool_str, host_len + 1);
-    (*sip_uri).host.ptr = pool_str;
-    (*sip_uri).host.slen = host_len as i64;
-    (*sip_uri).port = new_port as i32;
+    unsafe {
+        ptr::copy_nonoverlapping(host_cstr.as_ptr(), pool_str, host_len + 1);
+        (*sip_uri).host.ptr = pool_str;
+        (*sip_uri).host.slen = host_len as i64;
+        (*sip_uri).port = new_port as i32;
+    }
     true
 }
 
@@ -251,12 +252,13 @@ unsafe fn rewrite_sdp_body(
     old_ip: &str,
     new_ip: &str,
 ) -> bool {
-    let body = (*msg).body;
-    if body.is_null() || (*body).len == 0 || (*body).data.is_null() {
+    let body = unsafe { (*msg).body };
+    if body.is_null() || unsafe { (*body).len == 0 || (*body).data.is_null() } {
         return false;
     }
 
-    let body_slice = std::slice::from_raw_parts((*body).data as *const u8, (*body).len as usize);
+    let body_slice =
+        unsafe { std::slice::from_raw_parts((*body).data as *const u8, (*body).len as usize) };
     let Ok(sdp_str) = std::str::from_utf8(body_slice) else {
         return false;
     };
@@ -284,14 +286,16 @@ unsafe fn rewrite_sdp_body(
     }
 
     let new_len = new_sdp.len();
-    let new_body_ptr = pj_pool_alloc(pool, new_len) as *mut u8;
+    let new_body_ptr = unsafe { pj_pool_alloc(pool, new_len) } as *mut u8;
     if new_body_ptr.is_null() {
         return false;
     }
 
-    ptr::copy_nonoverlapping(new_sdp.as_ptr(), new_body_ptr, new_len);
-    (*body).data = new_body_ptr as *mut _;
-    (*body).len = new_len as u32;
+    unsafe {
+        ptr::copy_nonoverlapping(new_sdp.as_ptr(), new_body_ptr, new_len);
+        (*body).data = new_body_ptr as *mut _;
+        (*body).len = new_len as u32;
+    }
     true
 }
 
@@ -310,7 +314,7 @@ unsafe fn rewrite_local_network_tdata(tdata: *mut pjsip_tx_data, direction: &str
         return false;
     }
 
-    let Some(dst_ip) = extract_dst_ipv4(tdata) else {
+    let Some(dst_ip) = (unsafe { extract_dst_ipv4(tdata) }) else {
         return false;
     };
 
@@ -318,7 +322,7 @@ unsafe fn rewrite_local_network_tdata(tdata: *mut pjsip_tx_data, direction: &str
         return false;
     }
 
-    let msg = (*tdata).msg;
+    let msg = unsafe { (*tdata).msg };
     if msg.is_null() {
         return false;
     }
@@ -326,7 +330,7 @@ unsafe fn rewrite_local_network_tdata(tdata: *mut pjsip_tx_data, direction: &str
     let mut changed = false;
 
     // Rewrite Contact header
-    if rewrite_contact_host((*tdata).pool, msg, local_host, *port) {
+    if unsafe { rewrite_contact_host((*tdata).pool, msg, local_host, *port) } {
         tracing::debug!(
             "Rewrote {} Contact header for local client {}: host -> {}:{}",
             direction,
@@ -338,17 +342,17 @@ unsafe fn rewrite_local_network_tdata(tdata: *mut pjsip_tx_data, direction: &str
     }
 
     // Rewrite SDP body if we have an RTP public IP to replace
-    if let Some(public_ip) = rtp_public_ip {
-        if rewrite_sdp_body((*tdata).pool, msg, public_ip, local_host) {
-            tracing::debug!(
-                "Rewrote {} SDP for local client {}: {} -> {}",
-                direction,
-                dst_ip,
-                public_ip,
-                local_host
-            );
-            changed = true;
-        }
+    if let Some(public_ip) = rtp_public_ip
+        && unsafe { rewrite_sdp_body((*tdata).pool, msg, public_ip, local_host) }
+    {
+        tracing::debug!(
+            "Rewrote {} SDP for local client {}: {} -> {}",
+            direction,
+            dst_ip,
+            public_ip,
+            local_host
+        );
+        changed = true;
     }
 
     changed
@@ -370,42 +374,43 @@ unsafe fn rewrite_private_contact_for_external(tdata: *mut pjsip_tx_data, direct
         return false;
     }
 
-    let msg = (*tdata).msg;
+    let msg = unsafe { (*tdata).msg };
     if msg.is_null() {
         return false;
     }
 
     // Find Contact header
-    let contact_hdr = pjsip_msg_find_hdr(msg, pjsip_hdr_e_PJSIP_H_CONTACT, ptr::null_mut())
-        as *mut pjsip_contact_hdr;
+    let contact_hdr =
+        unsafe { pjsip_msg_find_hdr(msg, pjsip_hdr_e_PJSIP_H_CONTACT, ptr::null_mut()) }
+            as *mut pjsip_contact_hdr;
     if contact_hdr.is_null() {
         return false;
     }
 
-    let uri = (*contact_hdr).uri;
+    let uri = unsafe { (*contact_hdr).uri };
     if uri.is_null() {
         return false;
     }
 
     // Unwrap via vtable to handle pjsip_name_addr wrapping
-    let uri_vptr = (*(uri as *const pjsip_uri)).vptr;
+    let uri_vptr = unsafe { (*(uri as *const pjsip_uri)).vptr };
     if uri_vptr.is_null() {
         return false;
     }
-    let get_uri_fn = match (*uri_vptr).p_get_uri {
+    let get_uri_fn = match unsafe { (*uri_vptr).p_get_uri } {
         Some(f) => f,
         None => return false,
     };
-    let sip_uri_raw = get_uri_fn(uri as *mut std::os::raw::c_void);
+    let sip_uri_raw = unsafe { get_uri_fn(uri as *mut std::os::raw::c_void) };
     if sip_uri_raw.is_null() {
         return false;
     }
     let sip_uri = sip_uri_raw as *mut pjsip_sip_uri;
-    if (*sip_uri).host.ptr.is_null() || (*sip_uri).host.slen <= 0 {
+    if unsafe { (*sip_uri).host.ptr.is_null() || (*sip_uri).host.slen <= 0 } {
         return false;
     }
 
-    let host = pj_str_to_string(&(*sip_uri).host);
+    let host = unsafe { pj_str_to_string(&(*sip_uri).host) };
 
     // Only rewrite if Contact host is a private (RFC 1918) IP
     let contact_ip: Ipv4Addr = match host.parse() {
@@ -418,14 +423,14 @@ unsafe fn rewrite_private_contact_for_external(tdata: *mut pjsip_tx_data, direct
     }
 
     // Skip if destination is also private (local-network rewrite handles that)
-    if let Some(dst_ip) = extract_dst_ipv4(tdata) {
-        if is_rfc1918(dst_ip) {
-            return false;
-        }
+    if let Some(dst_ip) = unsafe { extract_dst_ipv4(tdata) }
+        && is_rfc1918(dst_ip)
+    {
+        return false;
     }
 
     // Rewrite Contact to public host
-    if rewrite_contact_host((*tdata).pool, msg, public_host, *port) {
+    if unsafe { rewrite_contact_host((*tdata).pool, msg, public_host, *port) } {
         tracing::debug!(
             "Rewrote {} Contact for external client: {} -> {}:{}",
             direction,
@@ -448,15 +453,17 @@ unsafe fn rewrite_private_contact_for_external(tdata: *mut pjsip_tx_data, direct
 /// 2. Public-host rewrite: for external clients, replace private Contact IPs
 ///    with the public hostname so they can route BYE back to us
 pub unsafe extern "C" fn on_tx_response_cb(tdata: *mut pjsip_tx_data) -> pj_status_t {
-    let local_rewrite = rewrite_local_network_tdata(tdata, "response");
-    let public_rewrite = rewrite_private_contact_for_external(tdata, "response");
+    let local_rewrite = unsafe { rewrite_local_network_tdata(tdata, "response") };
+    let public_rewrite = unsafe { rewrite_private_contact_for_external(tdata, "response") };
 
     // If we modified headers, the buffer was already serialized by mod-msg-print
     // (priority 8, before our module at priority 32). Invalidate and re-encode
     // so the changes actually reach the wire.
     if local_rewrite || public_rewrite {
-        pjsip_tx_data_invalidate_msg(tdata);
-        pjsip_tx_data_encode(tdata);
+        unsafe {
+            pjsip_tx_data_invalidate_msg(tdata);
+            pjsip_tx_data_encode(tdata);
+        }
     }
 
     pj_constants__PJ_SUCCESS as pj_status_t
@@ -465,15 +472,17 @@ pub unsafe extern "C" fn on_tx_response_cb(tdata: *mut pjsip_tx_data) -> pj_stat
 /// Callback to rewrite Contact header and SDP body in outgoing requests.
 /// Same dual-rewrite logic as the response path.
 pub unsafe extern "C" fn on_tx_request_cb(tdata: *mut pjsip_tx_data) -> pj_status_t {
-    let local_rewrite = rewrite_local_network_tdata(tdata, "request");
-    let public_rewrite = rewrite_private_contact_for_external(tdata, "request");
+    let local_rewrite = unsafe { rewrite_local_network_tdata(tdata, "request") };
+    let public_rewrite = unsafe { rewrite_private_contact_for_external(tdata, "request") };
 
     // If we modified headers, the buffer was already serialized by mod-msg-print
     // (priority 8, before our module at priority 32). Invalidate and re-encode
     // so the changes actually reach the wire.
     if local_rewrite || public_rewrite {
-        pjsip_tx_data_invalidate_msg(tdata);
-        pjsip_tx_data_encode(tdata);
+        unsafe {
+            pjsip_tx_data_invalidate_msg(tdata);
+            pjsip_tx_data_encode(tdata);
+        }
     }
 
     pj_constants__PJ_SUCCESS as pj_status_t
@@ -492,38 +501,37 @@ pub unsafe extern "C" fn on_rx_request_nat_fixup_cb(rdata: *mut pjsip_rx_data) -
         return pj_constants__PJ_FALSE as pj_bool_t;
     }
 
-    let msg = (*rdata).msg_info.msg;
+    let msg = unsafe { (*rdata).msg_info.msg };
     if msg.is_null() {
         return pj_constants__PJ_FALSE as pj_bool_t;
     }
 
     // Only process requests (safety check)
-    if (*msg).type_ != pjsip_msg_type_e_PJSIP_REQUEST_MSG {
+    if unsafe { (*msg).type_ } != pjsip_msg_type_e_PJSIP_REQUEST_MSG {
         return pj_constants__PJ_FALSE as pj_bool_t;
     }
 
     // Only process INVITE and re-INVITE (they carry SDP with media addresses)
-    let method_id = (*msg).line.req.method.id;
+    let method_id = unsafe { (*msg).line.req.method.id };
     if method_id != pjsip_method_e_PJSIP_INVITE_METHOD {
         return pj_constants__PJ_FALSE as pj_bool_t;
     }
 
     // Check if there's a body (SDP)
-    let body = (*msg).body;
-    if body.is_null() || (*body).len == 0 || (*body).data.is_null() {
+    let body = unsafe { (*msg).body };
+    if body.is_null() || unsafe { (*body).len == 0 || (*body).data.is_null() } {
         return pj_constants__PJ_FALSE as pj_bool_t;
     }
 
     // Extract source IP from packet info
-    let src_name = &(*rdata).pkt_info.src_name;
+    let src_name = unsafe { &(*rdata).pkt_info.src_name };
     let name_len = src_name
         .iter()
         .position(|&c| c == 0)
         .unwrap_or(src_name.len());
-    let src_ip_str = match std::str::from_utf8(std::slice::from_raw_parts(
-        src_name.as_ptr() as *const u8,
-        name_len,
-    )) {
+    let src_ip_str = match std::str::from_utf8(unsafe {
+        std::slice::from_raw_parts(src_name.as_ptr() as *const u8, name_len)
+    }) {
         Ok(s) => s,
         Err(_) => return pj_constants__PJ_FALSE as pj_bool_t,
     };
@@ -533,87 +541,89 @@ pub unsafe extern "C" fn on_rx_request_nat_fixup_cb(rdata: *mut pjsip_rx_data) -
     };
 
     // Parse SDP to find c= line IP and check if it's a private address
-    let body_slice = std::slice::from_raw_parts((*body).data as *const u8, (*body).len as usize);
+    let body_slice =
+        unsafe { std::slice::from_raw_parts((*body).data as *const u8, (*body).len as usize) };
     let sdp_str = match std::str::from_utf8(body_slice) {
         Ok(s) => s,
         Err(_) => return pj_constants__PJ_FALSE as pj_bool_t,
     };
 
     // Find any connection address in the SDP that needs NAT fixup.
-    // Check ALL c= lines (session-level and per-media) — if any contain a
+    // Check ALL c= lines (session-level and per-media) -- if any contain a
     // private IP different from the packet source, rewrite the SDP.
     let mut needs_rewrite = false;
     let mut private_ip_str: Option<&str> = None;
     for line in sdp_str.lines() {
         if let Some(addr_str) = line.strip_prefix("c=IN IP4 ") {
             let addr_str = addr_str.trim();
-            if let Ok(sdp_ip) = addr_str.parse::<Ipv4Addr>() {
-                if is_rfc1918(sdp_ip) && sdp_ip != src_ip {
-                    needs_rewrite = true;
-                    private_ip_str = Some(addr_str);
-                    break;
-                }
+            if let Ok(sdp_ip) = addr_str.parse::<Ipv4Addr>()
+                && is_rfc1918(sdp_ip)
+                && sdp_ip != src_ip
+            {
+                needs_rewrite = true;
+                private_ip_str = Some(addr_str);
+                break;
             }
         }
     }
 
-    if needs_rewrite {
-        if let Some(private_ip) = private_ip_str {
-            let pool = (*rdata).tp_info.pool;
-            if !pool.is_null() {
-                if rewrite_sdp_body(pool, msg, private_ip, src_ip_str) {
-                    tracing::debug!(
-                        "NAT fixup (INVITE): SDP rewritten {} -> {} (from {}:{})",
-                        private_ip,
-                        src_ip_str,
-                        src_ip_str,
-                        (*rdata).pkt_info.src_port
-                    );
-                }
-            }
+    if needs_rewrite && let Some(private_ip) = private_ip_str {
+        let pool = unsafe { (*rdata).tp_info.pool };
+        if !pool.is_null() && unsafe { rewrite_sdp_body(pool, msg, private_ip, src_ip_str) } {
+            tracing::debug!(
+                "NAT fixup (INVITE): SDP rewritten {} -> {} (from {}:{})",
+                private_ip,
+                src_ip_str,
+                src_ip_str,
+                unsafe { (*rdata).pkt_info.src_port }
+            );
         }
     }
 
     // Also rewrite Contact header if present and has private IP
-    let contact_hdr = pjsip_msg_find_hdr(msg, pjsip_hdr_e_PJSIP_H_CONTACT, ptr::null_mut())
-        as *mut pjsip_contact_hdr;
+    let contact_hdr =
+        unsafe { pjsip_msg_find_hdr(msg, pjsip_hdr_e_PJSIP_H_CONTACT, ptr::null_mut()) }
+            as *mut pjsip_contact_hdr;
     if !contact_hdr.is_null() {
-        let uri = (*contact_hdr).uri;
+        let uri = unsafe { (*contact_hdr).uri };
         if !uri.is_null() {
-            let uri_vptr = (*(uri as *const pjsip_uri)).vptr;
-            if !uri_vptr.is_null() {
-                if let Some(get_uri_fn) = (*uri_vptr).p_get_uri {
-                    let sip_uri_raw = get_uri_fn(uri as *mut std::os::raw::c_void);
-                    if !sip_uri_raw.is_null() {
-                        let sip_uri = sip_uri_raw as *mut pjsip_sip_uri;
-                        let contact_host = pj_str_to_string(&(*sip_uri).host);
-                        if let Ok(contact_ip) = contact_host.parse::<Ipv4Addr>() {
-                            if is_rfc1918(contact_ip) && contact_ip != src_ip {
-                                let src_port = (*rdata).pkt_info.src_port as u16;
-                                let pool = (*rdata).tp_info.pool;
-                                if !pool.is_null() {
-                                    if let Ok(new_host_cstr) = CString::new(src_ip_str) {
-                                        let host_len = src_ip_str.len();
-                                        let pool_str =
-                                            pj_pool_alloc(pool, host_len + 1) as *mut c_char;
-                                        if !pool_str.is_null() {
-                                            ptr::copy_nonoverlapping(
-                                                new_host_cstr.as_ptr(),
-                                                pool_str,
-                                                host_len + 1,
-                                            );
-                                            (*sip_uri).host.ptr = pool_str;
-                                            (*sip_uri).host.slen = host_len as i64;
-                                            (*sip_uri).port = src_port as i32;
-                                            tracing::debug!(
-                                                "NAT fixup (INVITE): Contact rewritten {} -> {}:{}",
-                                                contact_host,
-                                                src_ip_str,
-                                                src_port
-                                            );
-                                        }
-                                    }
+            let uri_vptr = unsafe { (*(uri as *const pjsip_uri)).vptr };
+            if !uri_vptr.is_null()
+                && let Some(get_uri_fn) = unsafe { (*uri_vptr).p_get_uri }
+            {
+                let sip_uri_raw = unsafe { get_uri_fn(uri as *mut std::os::raw::c_void) };
+                if !sip_uri_raw.is_null() {
+                    let sip_uri = sip_uri_raw as *mut pjsip_sip_uri;
+                    let contact_host = unsafe { pj_str_to_string(&(*sip_uri).host) };
+                    if let Ok(contact_ip) = contact_host.parse::<Ipv4Addr>()
+                        && is_rfc1918(contact_ip)
+                        && contact_ip != src_ip
+                    {
+                        let src_port = unsafe { (*rdata).pkt_info.src_port } as u16;
+                        let pool = unsafe { (*rdata).tp_info.pool };
+                        if !pool.is_null()
+                            && let Ok(new_host_cstr) = CString::new(src_ip_str)
+                        {
+                            let host_len = src_ip_str.len();
+                            let pool_str =
+                                unsafe { pj_pool_alloc(pool, host_len + 1) } as *mut c_char;
+                            if !pool_str.is_null() {
+                                unsafe {
+                                    ptr::copy_nonoverlapping(
+                                        new_host_cstr.as_ptr(),
+                                        pool_str,
+                                        host_len + 1,
+                                    );
+                                    (*sip_uri).host.ptr = pool_str;
+                                    (*sip_uri).host.slen = host_len as i64;
+                                    (*sip_uri).port = src_port as i32;
                                 }
+                                tracing::debug!(
+                                    "NAT fixup (INVITE): Contact rewritten {} -> {}:{}",
+                                    contact_host,
+                                    src_ip_str,
+                                    src_port
+                                );
                             }
                         }
                     }
@@ -624,26 +634,28 @@ pub unsafe extern "C" fn on_rx_request_nat_fixup_cb(rdata: *mut pjsip_rx_data) -
 
     // Sanitize SDP: strip dynamic payload types (96+) that lack a=rtpmap attributes.
     // Without this, PJSIP's SDP validator rejects these INVITEs with EMISSINGRTPMAP.
-    let body = (*msg).body;
-    if !body.is_null() && (*body).len > 0 && !(*body).data.is_null() {
+    let body = unsafe { (*msg).body };
+    if !body.is_null() && unsafe { (*body).len > 0 && !(*body).data.is_null() } {
         let body_slice =
-            std::slice::from_raw_parts((*body).data as *const u8, (*body).len as usize);
-        if let Ok(sdp_str) = std::str::from_utf8(body_slice) {
-            if let Some(sanitized) = sanitize_sdp_missing_rtpmap(sdp_str) {
-                let pool = (*rdata).tp_info.pool;
-                if !pool.is_null() {
-                    let new_len = sanitized.len();
-                    let new_body_ptr = pj_pool_alloc(pool, new_len) as *mut u8;
-                    if !new_body_ptr.is_null() {
+            unsafe { std::slice::from_raw_parts((*body).data as *const u8, (*body).len as usize) };
+        if let Ok(sdp_str) = std::str::from_utf8(body_slice)
+            && let Some(sanitized) = sanitize_sdp_missing_rtpmap(sdp_str)
+        {
+            let pool = unsafe { (*rdata).tp_info.pool };
+            if !pool.is_null() {
+                let new_len = sanitized.len();
+                let new_body_ptr = unsafe { pj_pool_alloc(pool, new_len) } as *mut u8;
+                if !new_body_ptr.is_null() {
+                    unsafe {
                         ptr::copy_nonoverlapping(sanitized.as_ptr(), new_body_ptr, new_len);
                         (*body).data = new_body_ptr as *mut _;
                         (*body).len = new_len as u32;
-                        tracing::debug!(
-                            "SDP sanitized: stripped orphan dynamic payload types (from {}:{})",
-                            src_ip_str,
-                            (*rdata).pkt_info.src_port
-                        );
                     }
+                    tracing::debug!(
+                        "SDP sanitized: stripped orphan dynamic payload types (from {}:{})",
+                        src_ip_str,
+                        unsafe { (*rdata).pkt_info.src_port }
+                    );
                 }
             }
         }
@@ -670,27 +682,26 @@ pub unsafe extern "C" fn on_rx_response_nat_fixup_cb(rdata: *mut pjsip_rx_data) 
         return pj_constants__PJ_FALSE as pj_bool_t;
     }
 
-    let msg = (*rdata).msg_info.msg;
+    let msg = unsafe { (*rdata).msg_info.msg };
     if msg.is_null() {
         return pj_constants__PJ_FALSE as pj_bool_t;
     }
 
     // Only process 1xx/2xx responses (provisional and success)
-    let status_code = (*msg).line.status.code;
+    let status_code = unsafe { (*msg).line.status.code };
     if !(100..300).contains(&status_code) {
         return pj_constants__PJ_FALSE as pj_bool_t;
     }
 
     // Extract source IP from pkt_info.src_name (null-terminated char array)
-    let src_name = &(*rdata).pkt_info.src_name;
+    let src_name = unsafe { &(*rdata).pkt_info.src_name };
     let name_len = src_name
         .iter()
         .position(|&c| c == 0)
         .unwrap_or(src_name.len());
-    let src_ip_str = match std::str::from_utf8(std::slice::from_raw_parts(
-        src_name.as_ptr() as *const u8,
-        name_len,
-    )) {
+    let src_ip_str = match std::str::from_utf8(unsafe {
+        std::slice::from_raw_parts(src_name.as_ptr() as *const u8, name_len)
+    }) {
         Ok(s) => s,
         Err(_) => return pj_constants__PJ_FALSE as pj_bool_t,
     };
@@ -698,11 +709,12 @@ pub unsafe extern "C" fn on_rx_response_nat_fixup_cb(rdata: *mut pjsip_rx_data) 
         Ok(ip) => ip,
         Err(_) => return pj_constants__PJ_FALSE as pj_bool_t, // IPv6 or invalid
     };
-    let src_port = (*rdata).pkt_info.src_port as u16;
+    let src_port = unsafe { (*rdata).pkt_info.src_port } as u16;
 
     // Find Contact header in the response
-    let contact_hdr = pjsip_msg_find_hdr(msg, pjsip_hdr_e_PJSIP_H_CONTACT, ptr::null_mut())
-        as *mut pjsip_contact_hdr;
+    let contact_hdr =
+        unsafe { pjsip_msg_find_hdr(msg, pjsip_hdr_e_PJSIP_H_CONTACT, ptr::null_mut()) }
+            as *mut pjsip_contact_hdr;
     if contact_hdr.is_null() {
         return pj_constants__PJ_FALSE as pj_bool_t;
     }
@@ -711,26 +723,26 @@ pub unsafe extern "C" fn on_rx_response_nat_fixup_cb(rdata: *mut pjsip_rx_data) 
     // The rx path requires vtable-based URI unwrapping (p_get_uri) because
     // the Contact URI may be wrapped in a pjsip_name_addr, unlike the tx
     // path where we can cast directly.
-    let uri = (*contact_hdr).uri;
+    let uri = unsafe { (*contact_hdr).uri };
     if uri.is_null() {
         return pj_constants__PJ_FALSE as pj_bool_t;
     }
-    let uri_vptr = (*(uri as *const pjsip_uri)).vptr;
+    let uri_vptr = unsafe { (*(uri as *const pjsip_uri)).vptr };
     if uri_vptr.is_null() {
         return pj_constants__PJ_FALSE as pj_bool_t;
     }
-    let get_uri_fn = match (*uri_vptr).p_get_uri {
+    let get_uri_fn = match unsafe { (*uri_vptr).p_get_uri } {
         Some(f) => f,
         None => return pj_constants__PJ_FALSE as pj_bool_t,
     };
-    let sip_uri_raw = get_uri_fn(uri as *mut std::os::raw::c_void);
+    let sip_uri_raw = unsafe { get_uri_fn(uri as *mut std::os::raw::c_void) };
     if sip_uri_raw.is_null() {
         return pj_constants__PJ_FALSE as pj_bool_t;
     }
     let sip_uri = sip_uri_raw as *mut pjsip_sip_uri;
 
     // Parse Contact host as IPv4
-    let contact_host = pj_str_to_string(&(*sip_uri).host);
+    let contact_host = unsafe { pj_str_to_string(&(*sip_uri).host) };
     let contact_ip: Ipv4Addr = match contact_host.parse() {
         Ok(ip) => ip,
         Err(_) => return pj_constants__PJ_FALSE as pj_bool_t, // Hostname, skip
@@ -753,12 +765,14 @@ pub unsafe extern "C" fn on_rx_response_nat_fixup_cb(rdata: *mut pjsip_rx_data) 
     );
 
     // Rewrite Contact URI host to the public source IP
-    let pool = (*rdata).tp_info.pool;
-    if !pool.is_null() {
-        if let Ok(new_host_cstr) = CString::new(src_ip_str) {
-            let host_len = src_ip_str.len();
-            let pool_str = pj_pool_alloc(pool, host_len + 1) as *mut c_char;
-            if !pool_str.is_null() {
+    let pool = unsafe { (*rdata).tp_info.pool };
+    if !pool.is_null()
+        && let Ok(new_host_cstr) = CString::new(src_ip_str)
+    {
+        let host_len = src_ip_str.len();
+        let pool_str = unsafe { pj_pool_alloc(pool, host_len + 1) } as *mut c_char;
+        if !pool_str.is_null() {
+            unsafe {
                 ptr::copy_nonoverlapping(new_host_cstr.as_ptr(), pool_str, host_len + 1);
                 (*sip_uri).host.ptr = pool_str;
                 (*sip_uri).host.slen = host_len as i64;
@@ -768,27 +782,28 @@ pub unsafe extern "C" fn on_rx_response_nat_fixup_cb(rdata: *mut pjsip_rx_data) 
     }
 
     // Rewrite SDP body: replace private IP with public source IP.
-    // Parse the SDP c= line directly to get the actual media IP — it may differ
+    // Parse the SDP c= line directly to get the actual media IP -- it may differ
     // from the Contact header IP (e.g., dual-homed phone or double NAT).
-    let body = (*msg).body;
-    if !body.is_null() && (*body).len > 0 && !(*body).data.is_null() {
+    let body = unsafe { (*msg).body };
+    if !body.is_null() && unsafe { (*body).len > 0 && !(*body).data.is_null() } {
         let body_slice =
-            std::slice::from_raw_parts((*body).data as *const u8, (*body).len as usize);
+            unsafe { std::slice::from_raw_parts((*body).data as *const u8, (*body).len as usize) };
         if let Ok(sdp_str) = std::str::from_utf8(body_slice) {
             for line in sdp_str.lines() {
                 if let Some(addr_str) = line.strip_prefix("c=IN IP4 ") {
                     let addr_str = addr_str.trim();
-                    if let Ok(sdp_ip) = addr_str.parse::<Ipv4Addr>() {
-                        if is_rfc1918(sdp_ip) && sdp_ip != src_ip {
-                            if rewrite_sdp_body(pool, msg, addr_str, src_ip_str) {
-                                tracing::debug!(
-                                    "NAT fixup: SDP rewritten {} -> {}",
-                                    addr_str,
-                                    src_ip_str
-                                );
-                            }
-                            break;
+                    if let Ok(sdp_ip) = addr_str.parse::<Ipv4Addr>()
+                        && is_rfc1918(sdp_ip)
+                        && sdp_ip != src_ip
+                    {
+                        if unsafe { rewrite_sdp_body(pool, msg, addr_str, src_ip_str) } {
+                            tracing::debug!(
+                                "NAT fixup: SDP rewritten {} -> {}",
+                                addr_str,
+                                src_ip_str
+                            );
                         }
+                        break;
                     }
                 }
             }

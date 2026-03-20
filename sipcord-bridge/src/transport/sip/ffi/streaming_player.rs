@@ -118,9 +118,9 @@ pub unsafe extern "C" fn streaming_get_frame(
 
     // Fill frame buffer
     if !samples.is_empty() {
-        super::frame_utils::fill_audio_frame(frame, &samples);
+        unsafe { super::frame_utils::fill_audio_frame(frame, &samples) };
     } else {
-        super::frame_utils::fill_silence_frame(frame);
+        unsafe { super::frame_utils::fill_silence_frame(frame) };
     }
 
     pj_constants__PJ_SUCCESS as pj_status_t

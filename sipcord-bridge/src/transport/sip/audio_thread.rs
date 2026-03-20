@@ -230,27 +230,27 @@ pub fn stop_audio_thread() {
     // If the thread is blocked on a conference bridge lock, we don't want
     // shutdown to hang indefinitely. The 2s force-exit timer in main.rs
     // is a final backstop, but this avoids relying on a hard process exit.
-    if let Some(handle_storage) = AUDIO_THREAD_HANDLE.get() {
-        if let Some(handle) = handle_storage.lock().take() {
-            tracing::debug!("Joining audio thread (2s timeout)...");
-            let (done_tx, done_rx) = std::sync::mpsc::channel();
-            let join_thread = std::thread::spawn(move || {
-                let result = handle.join();
-                let _ = done_tx.send(result);
-            });
-            match done_rx.recv_timeout(std::time::Duration::from_secs(2)) {
-                Ok(Ok(())) => {
-                    tracing::debug!("Audio thread joined successfully");
-                }
-                Ok(Err(e)) => {
-                    tracing::error!("Audio thread panicked: {:?}", e);
-                }
-                Err(_) => {
-                    tracing::warn!("Audio thread join timed out after 2s, detaching");
-                    // Detach the join thread — the audio thread will be
-                    // cleaned up by process exit
-                    drop(join_thread);
-                }
+    if let Some(handle_storage) = AUDIO_THREAD_HANDLE.get()
+        && let Some(handle) = handle_storage.lock().take()
+    {
+        tracing::debug!("Joining audio thread (2s timeout)...");
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let join_thread = std::thread::spawn(move || {
+            let result = handle.join();
+            let _ = done_tx.send(result);
+        });
+        match done_rx.recv_timeout(std::time::Duration::from_secs(2)) {
+            Ok(Ok(())) => {
+                tracing::debug!("Audio thread joined successfully");
+            }
+            Ok(Err(e)) => {
+                tracing::error!("Audio thread panicked: {:?}", e);
+            }
+            Err(_) => {
+                tracing::warn!("Audio thread join timed out after 2s, detaching");
+                // Detach the join thread — the audio thread will be
+                // cleaned up by process exit
+                drop(join_thread);
             }
         }
     }
@@ -331,15 +331,15 @@ fn process_pending_pjsua_ops() {
             PendingPjsuaOp::Hangup { call_id } => Some(*call_id),
             PendingPjsuaOp::ConnectFaxPort { call_id, .. } => Some(*call_id),
         };
-        if let Some(cid) = call_id {
-            if !is_call_valid(cid) {
-                tracing::warn!("Skipping stale op for dead call {}: {:?}", cid, op);
-                // For ConnectFaxPort, signal failure so the caller doesn't hang
-                if let PendingPjsuaOp::ConnectFaxPort { done_tx, .. } = op {
-                    let _ = done_tx.send(false);
-                }
-                continue;
+        if let Some(cid) = call_id
+            && !is_call_valid(cid)
+        {
+            tracing::warn!("Skipping stale op for dead call {}: {:?}", cid, op);
+            // For ConnectFaxPort, signal failure so the caller doesn't hang
+            if let PendingPjsuaOp::ConnectFaxPort { done_tx, .. } = op {
+                let _ = done_tx.send(false);
             }
+            continue;
         }
         count += 1;
         match op {
@@ -559,7 +559,7 @@ unsafe fn process_audio_frame(
         timestamp: pj_timestamp { u64_: *timestamp },
         bit_info: 0,
     };
-    pjmedia_port_get_frame(master_port, &mut clock_frame);
+    unsafe { pjmedia_port_get_frame(master_port, &mut clock_frame) };
 
     // Now drain the SIP->Discord buffers that were filled by channel_port_put_frame callbacks
     // during the conference tick above.
@@ -718,11 +718,11 @@ pub fn check_rtp_inactivity() {
             }
         }
 
-        if let Some(sender_lock) = TIMEOUT_EVENT_TX.get() {
-            if let Some(ref tx) = *sender_lock.lock() {
-                for (call_id, rx_count) in timed_out_calls {
-                    let _ = tx.send(super::SipEvent::CallTimeout { call_id, rx_count });
-                }
+        if let Some(sender_lock) = TIMEOUT_EVENT_TX.get()
+            && let Some(ref tx) = *sender_lock.lock()
+        {
+            for (call_id, rx_count) in timed_out_calls {
+                let _ = tx.send(super::SipEvent::CallTimeout { call_id, rx_count });
             }
         }
     }

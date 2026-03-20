@@ -941,11 +941,11 @@ fn decode_group4(data: &[u8], width: u32, height: u32) -> Result<Vec<Vec<u16>>> 
 
     for _ in 0..height {
         // Check for EOFB (End Of Facsimile Block): two consecutive EOL codes
-        if let Some(v) = reader.peek(12) {
-            if v == 0x001 {
-                // Possible EOFB — check for second EOL
-                break;
-            }
+        if let Some(v) = reader.peek(12)
+            && v == 0x001
+        {
+            // Possible EOFB — check for second EOL
+            break;
         }
 
         let line = match decode_line_2d(&mut reader, &reference, w) {

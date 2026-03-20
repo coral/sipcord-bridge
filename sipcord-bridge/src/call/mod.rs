@@ -40,6 +40,9 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, trace, warn};
 use udptl::AsyncUdptlSocket;
 
+/// Type alias for fax session entries stored in the DashMap.
+type FaxSessionEntry = (Arc<tokio::sync::Mutex<FaxSession>>, CancellationToken);
+
 /// Ring buffer capacity for Discord→SIP audio (i16 mono @ 16kHz).
 /// 3200 samples = 200ms of audio, enough for timing jitter.
 const DISCORD_TO_SIP_RING_BUFFER_SIZE: usize = 3200;
@@ -107,7 +110,7 @@ struct BridgeContext {
     sip_calls: Arc<DashMap<CallId, SipCallInfo>>,
     /// Active fax sessions keyed by SIP call ID.
     /// Each entry holds the session and a cancellation token for the T.38 processing task.
-    fax_sessions: Arc<DashMap<CallId, (Arc<tokio::sync::Mutex<FaxSession>>, CancellationToken)>>,
+    fax_sessions: Arc<DashMap<CallId, FaxSessionEntry>>,
     discord_event_tx: Sender<DiscordEvent>,
     sip_cmd_tx: Sender<SipCommand>,
     sound_manager: Arc<SoundManager>,
@@ -127,7 +130,7 @@ pub struct BridgeCoordinator {
     sip_calls: Arc<DashMap<CallId, SipCallInfo>>,
     /// Active fax sessions keyed by SIP call ID.
     /// Each entry holds the session and a cancellation token for the T.38 processing task.
-    fax_sessions: Arc<DashMap<CallId, (Arc<tokio::sync::Mutex<FaxSession>>, CancellationToken)>>,
+    fax_sessions: Arc<DashMap<CallId, FaxSessionEntry>>,
     /// Stores outbound call requests by tracking_id so the answered handler can retrieve them.
     /// Entries are cleaned on answer/fail and periodically swept for stale entries.
     outbound_requests: Arc<DashMap<String, OutboundCallRequest>>,
@@ -221,28 +224,28 @@ impl BridgeCoordinator {
                         );
 
                         // Check for config-based extension sounds (easter eggs)
-                        if let Ok(ext_num) = extension.parse::<u32>() {
-                            if let Some(sound_name) = sound_manager.get_extension_sound(ext_num) {
-                                info!(
-                                    "Extension {} maps to sound '{}' (call {})",
-                                    ext_num, sound_name, call_id
-                                );
+                        if let Ok(ext_num) = extension.parse::<u32>()
+                            && let Some(sound_name) = sound_manager.get_extension_sound(ext_num)
+                        {
+                            info!(
+                                "Extension {} maps to sound '{}' (call {})",
+                                ext_num, sound_name, call_id
+                            );
 
-                                let sound_manager = sound_manager.clone();
-                                let sip_cmd_tx = sip_cmd_tx.clone();
-                                let sound_name = sound_name.to_string();
+                            let sound_manager = sound_manager.clone();
+                            let sip_cmd_tx = sip_cmd_tx.clone();
+                            let sound_name = sound_name.to_string();
 
-                                tokio::spawn(async move {
-                                    play_extension_sound_and_hangup(
-                                        call_id,
-                                        &sound_name,
-                                        &sound_manager,
-                                        &sip_cmd_tx,
-                                    )
-                                    .await;
-                                });
-                                continue;
-                            }
+                            tokio::spawn(async move {
+                                play_extension_sound_and_hangup(
+                                    call_id,
+                                    &sound_name,
+                                    &sound_manager,
+                                    &sip_cmd_tx,
+                                )
+                                .await;
+                            });
+                            continue;
                         }
 
                         // Track this call
@@ -325,34 +328,34 @@ impl BridgeCoordinator {
                             backend.on_call_ended(&sip_call_id_str).await;
                         });
 
-                        if let Some((_, call_info)) = sip_calls.remove(&call_id) {
-                            if let Some(channel_id) = call_info.channel_id {
-                                let should_destroy = {
-                                    if let Some(mut bridge) = bridges.get_mut(&channel_id) {
-                                        bridge.sip_calls.remove(&call_id);
-                                        info!(
-                                            "Removed call {} from bridge for channel {} ({} callers remaining)",
-                                            call_id,
-                                            channel_id,
-                                            bridge.sip_calls.len()
-                                        );
-                                        bridge.sip_calls.is_empty()
-                                    } else {
-                                        false
-                                    }
-                                };
-
-                                if should_destroy {
+                        if let Some((_, call_info)) = sip_calls.remove(&call_id)
+                            && let Some(channel_id) = call_info.channel_id
+                        {
+                            let should_destroy = {
+                                if let Some(mut bridge) = bridges.get_mut(&channel_id) {
+                                    bridge.sip_calls.remove(&call_id);
                                     info!(
-                                        "Last caller left, destroying bridge for channel {}",
-                                        channel_id
+                                        "Removed call {} from bridge for channel {} ({} callers remaining)",
+                                        call_id,
+                                        channel_id,
+                                        bridge.sip_calls.len()
                                     );
-                                    cleanup_channel_port(channel_id);
-                                    teardown_channel_ring_buffers(channel_id);
+                                    bridge.sip_calls.is_empty()
+                                } else {
+                                    false
+                                }
+                            };
 
-                                    if let Some((_, bridge)) = bridges.remove(&channel_id) {
-                                        bridge.discord_connection.disconnect().await;
-                                    }
+                            if should_destroy {
+                                info!(
+                                    "Last caller left, destroying bridge for channel {}",
+                                    channel_id
+                                );
+                                cleanup_channel_port(channel_id);
+                                teardown_channel_ring_buffers(channel_id);
+
+                                if let Some((_, bridge)) = bridges.remove(&channel_id) {
+                                    bridge.discord_connection.disconnect().await;
                                 }
                             }
                         }
@@ -366,16 +369,15 @@ impl BridgeCoordinator {
 
                         // If no audio was ever received, report no_audio to the coordinator
                         // so the Discord embed can show a diagnostic message
-                        if rx_count == 0 {
-                            if let Some(call_info) = sip_calls.get(&call_id) {
-                                if let Some(ref tracking_id) = call_info.tracking_id {
-                                    info!(
-                                        "Call {} had zero RTP packets, reporting no_audio (tracking_id={})",
-                                        call_id, tracking_id
-                                    );
-                                    backend_for_sip.report_call_status(tracking_id, "no_audio");
-                                }
-                            }
+                        if rx_count == 0
+                            && let Some(call_info) = sip_calls.get(&call_id)
+                            && let Some(ref tracking_id) = call_info.tracking_id
+                        {
+                            info!(
+                                "Call {} had zero RTP packets, reporting no_audio (tracking_id={})",
+                                call_id, tracking_id
+                            );
+                            backend_for_sip.report_call_status(tracking_id, "no_audio");
                         }
 
                         let _ = sip_cmd_tx.send(SipCommand::Hangup { call_id });
@@ -1621,26 +1623,26 @@ async fn play_extension_sound_and_hangup(
     }
 
     // Check if this is a streaming sound (large file)
-    if sound_manager.is_streaming(sound_name) {
-        if let Some(config) = sound_manager.get_streaming(sound_name) {
-            info!(
-                "Starting streaming playback '{}' from {} for call {}",
-                sound_name,
-                config.path.display(),
-                call_id
-            );
+    if sound_manager.is_streaming(sound_name)
+        && let Some(config) = sound_manager.get_streaming(sound_name)
+    {
+        info!(
+            "Starting streaming playback '{}' from {} for call {}",
+            sound_name,
+            config.path.display(),
+            call_id
+        );
 
-            // Use the new port-based streaming approach
-            // The audio thread handles timing and the hangup happens automatically when done
-            let _ = sip_cmd_tx.send(SipCommand::StartStreaming {
-                call_id,
-                path: config.path.clone(),
-            });
+        // Use the new port-based streaming approach
+        // The audio thread handles timing and the hangup happens automatically when done
+        let _ = sip_cmd_tx.send(SipCommand::StartStreaming {
+            call_id,
+            path: config.path.clone(),
+        });
 
-            // Don't hangup here - the streaming player will hangup when done
-            // or when the call ends (detected via CALL_CONF_PORTS check)
-            return;
-        }
+        // Don't hangup here - the streaming player will hangup when done
+        // or when the call ends (detected via CALL_CONF_PORTS check)
+        return;
     }
 
     // Preloaded sound - play all at once
@@ -1805,17 +1807,16 @@ async fn process_fax_audio(
             }
             let tx_available = tx_producer.slots();
             let to_write = tx_generated.min(tx_available);
-            if to_write > 0 {
-                if let Ok(mut chunk) = tx_producer.write_chunk(to_write) {
-                    let (first, second) = chunk.as_mut_slices();
-                    let first_len = first.len().min(to_write);
-                    first[..first_len].copy_from_slice(&tx_buf[..first_len]);
-                    if first_len < to_write {
-                        second[..to_write - first_len]
-                            .copy_from_slice(&tx_buf[first_len..to_write]);
-                    }
-                    chunk.commit_all();
+            if to_write > 0
+                && let Ok(mut chunk) = tx_producer.write_chunk(to_write)
+            {
+                let (first, second) = chunk.as_mut_slices();
+                let first_len = first.len().min(to_write);
+                first[..first_len].copy_from_slice(&tx_buf[..first_len]);
+                if first_len < to_write {
+                    second[..to_write - first_len].copy_from_slice(&tx_buf[first_len..to_write]);
                 }
+                chunk.commit_all();
             }
         } else {
             tx_silent_frames += 1;

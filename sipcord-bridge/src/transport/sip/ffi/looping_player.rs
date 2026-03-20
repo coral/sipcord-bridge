@@ -38,6 +38,10 @@ pub struct LoopingPlayerState {
 
 /// Custom get_frame callback for looping player ports
 /// Returns samples from the player's buffer, looping back to start when reaching end
+///
+/// # Safety
+/// Called by the pjmedia conference bridge. `this_port` and `frame` must be
+/// valid, non-null pointers to pjmedia structures owned by pjsua.
 pub unsafe extern "C" fn looping_player_get_frame(
     this_port: *mut pjmedia_port,
     frame: *mut pjmedia_frame,
@@ -73,7 +77,9 @@ pub unsafe extern "C" fn looping_player_get_frame(
             if player_data.is_active.load(Ordering::SeqCst) && !player_data.samples.is_empty() {
                 let pos = player_data.position;
                 let end = (pos + SAMPLES_PER_FRAME).min(player_data.samples.len());
-                super::frame_utils::fill_audio_frame(frame, &player_data.samples[pos..end]);
+                unsafe {
+                    super::frame_utils::fill_audio_frame(frame, &player_data.samples[pos..end])
+                };
 
                 // Advance position, loop back if at end
                 player_data.position = if end >= player_data.samples.len() {
@@ -82,10 +88,10 @@ pub unsafe extern "C" fn looping_player_get_frame(
                     end
                 };
             } else {
-                super::frame_utils::fill_silence_frame(frame);
+                unsafe { super::frame_utils::fill_silence_frame(frame) };
             }
         } else {
-            super::frame_utils::fill_silence_frame(frame);
+            unsafe { super::frame_utils::fill_silence_frame(frame) };
         }
     }
 
@@ -93,6 +99,10 @@ pub unsafe extern "C" fn looping_player_get_frame(
 }
 
 /// Custom on_destroy callback for looping player ports
+///
+/// # Safety
+/// Called by pjmedia when the port is being destroyed. `this_port` must be
+/// a valid pointer to a pjmedia_port that was previously created by this module.
 pub unsafe extern "C" fn looping_player_on_destroy(this_port: *mut pjmedia_port) -> pj_status_t {
     if !this_port.is_null() {
         let port_key = this_port as usize;
@@ -194,10 +204,10 @@ pub fn stop_loop(call_id: CallId) {
 
     if let Some(state) = state {
         // Mark as inactive (get_frame will return silence)
-        if let Some(data) = LOOPING_PLAYER_DATA.get() {
-            if let Some(player_data) = data.lock().get(&state.port_key) {
-                player_data.is_active.store(false, Ordering::SeqCst);
-            }
+        if let Some(data) = LOOPING_PLAYER_DATA.get()
+            && let Some(player_data) = data.lock().get(&state.port_key)
+        {
+            player_data.is_active.store(false, Ordering::SeqCst);
         }
 
         // Remove from conference

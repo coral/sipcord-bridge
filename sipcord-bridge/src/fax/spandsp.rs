@@ -115,12 +115,14 @@ unsafe fn configure_log_state(log_state: *mut spandsp_sys::logging_state_t) {
         return;
     }
     let log_level = LogLevel::Flow as i32 | LogShowFlags::TAG.bits();
-    spandsp_sys::span_log_set_level(log_state, log_level);
-    spandsp_sys::span_log_set_message_handler(
-        log_state,
-        Some(spandsp_log_handler),
-        std::ptr::null_mut(),
-    );
+    unsafe {
+        spandsp_sys::span_log_set_level(log_state, log_level);
+        spandsp_sys::span_log_set_message_handler(
+            log_state,
+            Some(spandsp_log_handler),
+            std::ptr::null_mut(),
+        );
+    }
 }
 
 /// Check fax reception completion status from callback state.
@@ -467,8 +469,11 @@ unsafe extern "C" fn tx_packet_handler(
     if user_data.is_null() || buf.is_null() || len <= 0 {
         return -1;
     }
-    let state = &*(user_data as *const TxCallbackState);
-    let data = std::slice::from_raw_parts(buf, len as usize);
+    let (state, data) = unsafe {
+        let state = &*(user_data as *const TxCallbackState);
+        let data = std::slice::from_raw_parts(buf, len as usize);
+        (state, data)
+    };
     debug!("SpanDSP TX IFP: {}B (count={})", len, count);
     // Send the packet `count` times as SpanDSP requests.
     // For indicator packets (CNG, CED, DIS), count is typically 3 — these
@@ -491,7 +496,7 @@ unsafe extern "C" fn tx_packet_handler(
 /// Phase B handler: called when T.30 negotiation starts.
 unsafe extern "C" fn phase_b_handler(user_data: *mut std::ffi::c_void, result: i32) -> i32 {
     if !user_data.is_null() {
-        let state = &mut *(user_data as *mut FaxCallbackState);
+        let state = unsafe { &mut *(user_data as *mut FaxCallbackState) };
         state.negotiation_started = true;
         info!(
             "SpanDSP phase B: fax negotiation started (result={})",
@@ -504,7 +509,7 @@ unsafe extern "C" fn phase_b_handler(user_data: *mut std::ffi::c_void, result: i
 /// Phase D handler: called when a page is received.
 unsafe extern "C" fn phase_d_handler(user_data: *mut std::ffi::c_void, result: i32) -> i32 {
     if !user_data.is_null() {
-        let state = &mut *(user_data as *mut FaxCallbackState);
+        let state = unsafe { &mut *(user_data as *mut FaxCallbackState) };
         state.pages_received += 1;
         info!(
             "SpanDSP phase D: page {} received (result={})",
@@ -517,7 +522,7 @@ unsafe extern "C" fn phase_d_handler(user_data: *mut std::ffi::c_void, result: i
 /// Phase E handler: called when fax reception completes (success or failure).
 unsafe extern "C" fn phase_e_handler(user_data: *mut std::ffi::c_void, completion_code: i32) {
     if !user_data.is_null() {
-        let state = &mut *(user_data as *mut FaxCallbackState);
+        let state = unsafe { &mut *(user_data as *mut FaxCallbackState) };
         state.completion_code = completion_code;
         state.completed = true;
 
@@ -550,7 +555,7 @@ unsafe extern "C" fn spandsp_log_handler(
     if text.is_null() {
         return;
     }
-    let msg = std::ffi::CStr::from_ptr(text).to_string_lossy();
+    let msg = unsafe { std::ffi::CStr::from_ptr(text) }.to_string_lossy();
     let msg = msg.trim_end(); // SpanDSP messages often have trailing newlines
 
     match level {

@@ -1112,19 +1112,18 @@ impl VoiceEventHandler for VoiceReceiver {
                     // CRITICAL: Skip our own SSRC to prevent feedback loop
                     // When we send audio to Discord, it comes back in VoiceTick.
                     // If we don't filter it out, we get: SIP -> Discord -> SIP -> Discord -> ...
-                    if let Some(ref map) = ssrc_map {
-                        if let Some(&user_id) = map.get(ssrc) {
-                            if user_id == self.bot_user_id {
-                                skipped_self = true;
-                                if should_log {
-                                    trace!(
-                                        "VoiceTick: Skipping bot's own SSRC {} to prevent feedback",
-                                        ssrc
-                                    );
-                                }
-                                continue;
-                            }
+                    if let Some(ref map) = ssrc_map
+                        && let Some(&user_id) = map.get(ssrc)
+                        && user_id == self.bot_user_id
+                    {
+                        skipped_self = true;
+                        if should_log {
+                            trace!(
+                                "VoiceTick: Skipping bot's own SSRC {} to prevent feedback",
+                                ssrc
+                            );
                         }
+                        continue;
                     }
 
                     if let Some(ref decoded) = voice_data.decoded_voice {

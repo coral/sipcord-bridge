@@ -11,7 +11,7 @@ pub unsafe fn pj_str_to_string(s: &pj_str_t) -> String {
         return String::new();
     }
 
-    let slice = std::slice::from_raw_parts(s.ptr as *const u8, s.slen as usize);
+    let slice = unsafe { std::slice::from_raw_parts(s.ptr as *const u8, s.slen as usize) };
     String::from_utf8_lossy(slice).to_string()
 }
 

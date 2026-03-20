@@ -84,10 +84,12 @@ pub unsafe extern "C" fn channel_port_get_frame(
         return -1; // PJ_EINVAL
     }
 
-    let channel_id = Snowflake::new((*this_port).port_data.ldata as u64);
+    let channel_id = unsafe { Snowflake::new((*this_port).port_data.ldata as u64) };
     if *channel_id == 0 {
-        (*frame).type_ = pjmedia_frame_type_PJMEDIA_FRAME_TYPE_NONE;
-        (*frame).size = 0;
+        unsafe {
+            (*frame).type_ = pjmedia_frame_type_PJMEDIA_FRAME_TYPE_NONE;
+            (*frame).size = 0;
+        }
         return pj_constants__PJ_SUCCESS as pj_status_t;
     }
 
@@ -169,10 +171,10 @@ pub unsafe extern "C" fn channel_port_get_frame(
     }
 
     if samples_len > 0 {
-        let samples = std::slice::from_raw_parts(samples_ptr, samples_len);
-        super::ffi::frame_utils::fill_audio_frame(frame, samples);
+        let samples = unsafe { std::slice::from_raw_parts(samples_ptr, samples_len) };
+        unsafe { super::ffi::frame_utils::fill_audio_frame(frame, samples) };
     } else {
-        super::ffi::frame_utils::fill_silence_frame(frame);
+        unsafe { super::ffi::frame_utils::fill_silence_frame(frame) };
     }
 
     pj_constants__PJ_SUCCESS as pj_status_t
@@ -186,51 +188,51 @@ fn get_samples_from_buffer(channel_id: Snowflake, buf: &mut [i16; SAMPLES_PER_FR
     static DRAIN_COUNT: AtomicU64 = AtomicU64::new(0);
     static UNDERRUN_COUNT: AtomicU64 = AtomicU64::new(0);
 
-    if let Some(consumer_entry) = get_discord_to_sip_consumers().get(&channel_id) {
-        if let Some(mut consumer) = consumer_entry.try_lock() {
-            let available = consumer.slots();
-            if available >= SAMPLES_PER_FRAME {
-                let count = DRAIN_COUNT.fetch_add(1, Ordering::Relaxed);
-                if count.is_multiple_of(250) {
-                    tracing::debug!(
-                        "Discord->SIP drain: channel={}, available={}, draining {}",
-                        channel_id,
-                        available,
-                        SAMPLES_PER_FRAME
-                    );
-                }
-                if let Ok(chunk) = consumer.read_chunk(SAMPLES_PER_FRAME) {
-                    let (first, second) = chunk.as_slices();
-                    buf[..first.len()].copy_from_slice(first);
-                    if !second.is_empty() {
-                        buf[first.len()..first.len() + second.len()].copy_from_slice(second);
-                    }
-                    chunk.commit_all();
-                }
-                return SAMPLES_PER_FRAME;
-            } else if available > 0 {
-                // Partial buffer - drain what we have, zero-fill the rest
-                let underruns = UNDERRUN_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
-                if underruns <= 10 || underruns.is_multiple_of(100) {
-                    tracing::warn!(
-                        "BUFFER UNDERRUN (Discord->SIP): channel={}, only {} available (need {}), total: {}",
-                        channel_id,
-                        available,
-                        SAMPLES_PER_FRAME,
-                        underruns
-                    );
-                }
-                buf[available..].fill(0);
-                if let Ok(chunk) = consumer.read_chunk(available) {
-                    let (first, second) = chunk.as_slices();
-                    buf[..first.len()].copy_from_slice(first);
-                    if !second.is_empty() {
-                        buf[first.len()..first.len() + second.len()].copy_from_slice(second);
-                    }
-                    chunk.commit_all();
-                }
-                return available;
+    if let Some(consumer_entry) = get_discord_to_sip_consumers().get(&channel_id)
+        && let Some(mut consumer) = consumer_entry.try_lock()
+    {
+        let available = consumer.slots();
+        if available >= SAMPLES_PER_FRAME {
+            let count = DRAIN_COUNT.fetch_add(1, Ordering::Relaxed);
+            if count.is_multiple_of(250) {
+                tracing::debug!(
+                    "Discord->SIP drain: channel={}, available={}, draining {}",
+                    channel_id,
+                    available,
+                    SAMPLES_PER_FRAME
+                );
             }
+            if let Ok(chunk) = consumer.read_chunk(SAMPLES_PER_FRAME) {
+                let (first, second) = chunk.as_slices();
+                buf[..first.len()].copy_from_slice(first);
+                if !second.is_empty() {
+                    buf[first.len()..first.len() + second.len()].copy_from_slice(second);
+                }
+                chunk.commit_all();
+            }
+            return SAMPLES_PER_FRAME;
+        } else if available > 0 {
+            // Partial buffer - drain what we have, zero-fill the rest
+            let underruns = UNDERRUN_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+            if underruns <= 10 || underruns.is_multiple_of(100) {
+                tracing::warn!(
+                    "BUFFER UNDERRUN (Discord->SIP): channel={}, only {} available (need {}), total: {}",
+                    channel_id,
+                    available,
+                    SAMPLES_PER_FRAME,
+                    underruns
+                );
+            }
+            buf[available..].fill(0);
+            if let Ok(chunk) = consumer.read_chunk(available) {
+                let (first, second) = chunk.as_slices();
+                buf[..first.len()].copy_from_slice(first);
+                if !second.is_empty() {
+                    buf[first.len()..first.len() + second.len()].copy_from_slice(second);
+                }
+                chunk.commit_all();
+            }
+            return available;
         }
     }
 
@@ -254,11 +256,13 @@ pub unsafe extern "C" fn channel_port_put_frame(
     }
 
     // Only process audio frames with data
-    if (*frame).type_ != pjmedia_frame_type_PJMEDIA_FRAME_TYPE_AUDIO || (*frame).size == 0 {
+    if unsafe {
+        (*frame).type_ != pjmedia_frame_type_PJMEDIA_FRAME_TYPE_AUDIO || (*frame).size == 0
+    } {
         return pj_constants__PJ_SUCCESS as pj_status_t;
     }
 
-    let channel_id = Snowflake::new((*this_port).port_data.ldata as u64);
+    let channel_id = unsafe { Snowflake::new((*this_port).port_data.ldata as u64) };
     if *channel_id == 0 {
         return pj_constants__PJ_SUCCESS as pj_status_t;
     }
@@ -270,16 +274,18 @@ pub unsafe extern "C" fn channel_port_put_frame(
             call_count,
             this_port,
             channel_id,
-            (*frame).size
+            unsafe { (*frame).size }
         );
     } else if call_count == 10 {
         tracing::trace!("channel_port_put_frame: suppressing further per-call logs");
     }
 
     // View frame buffer as i16 slice (zero-copy)
-    let num_samples = (*frame).size / 2;
-    let frame_buf = (*frame).buf as *const i16;
-    let samples = std::slice::from_raw_parts(frame_buf, num_samples);
+    let samples = unsafe {
+        let num_samples = (*frame).size / 2;
+        let frame_buf = (*frame).buf as *const i16;
+        std::slice::from_raw_parts(frame_buf, num_samples)
+    };
 
     // Store in the SIP->Discord buffer for this channel
     let buffers = CHANNEL_AUDIO_IN.get_or_init(DashMap::new);
@@ -324,7 +330,7 @@ pub unsafe extern "C" fn channel_port_put_frame(
 /// Custom on_destroy callback for channel buffer ports
 pub unsafe extern "C" fn channel_port_on_destroy(this_port: *mut pjmedia_port) -> pj_status_t {
     if !this_port.is_null() {
-        // Remove from reverse mapping
+        // Remove from reverse mapping (no unsafe ops needed here, just pointer-to-usize cast)
         let port_key = this_port as usize;
         if let Some(mapping) = PORT_TO_CHANNEL.get() {
             mapping.lock().remove(&port_key);
@@ -348,10 +354,12 @@ unsafe fn connect_call_to_channel(
 ) {
     // Connect this call to other calls in the same channel
     for &(other_call_id, other_conf_port) in other_calls {
-        let status1 =
-            pjmedia_conf_connect_port(conf, *conf_port as u32, *other_conf_port as u32, 0);
-        let status2 =
-            pjmedia_conf_connect_port(conf, *other_conf_port as u32, *conf_port as u32, 0);
+        let (status1, status2) = unsafe {
+            (
+                pjmedia_conf_connect_port(conf, *conf_port as u32, *other_conf_port as u32, 0),
+                pjmedia_conf_connect_port(conf, *other_conf_port as u32, *conf_port as u32, 0),
+            )
+        };
 
         if status1 == pj_constants__PJ_SUCCESS as i32 && status2 == pj_constants__PJ_SUCCESS as i32
         {
@@ -377,10 +385,14 @@ unsafe fn connect_call_to_channel(
 
     // Connect call to channel's conference port bidirectionally
     if let Some(channel_slot) = get_or_create_channel_port(channel_id) {
-        // Channel port -> call (Discord audio reaches this call)
-        let status1 = pjmedia_conf_connect_port(conf, *channel_slot as u32, *conf_port as u32, 0);
-        // Call -> channel port (SIP audio goes to channel for Discord)
-        let status2 = pjmedia_conf_connect_port(conf, *conf_port as u32, *channel_slot as u32, 0);
+        let (status1, status2) = unsafe {
+            (
+                // Channel port -> call (Discord audio reaches this call)
+                pjmedia_conf_connect_port(conf, *channel_slot as u32, *conf_port as u32, 0),
+                // Call -> channel port (SIP audio goes to channel for Discord)
+                pjmedia_conf_connect_port(conf, *conf_port as u32, *channel_slot as u32, 0),
+            )
+        };
 
         if status1 != pj_constants__PJ_SUCCESS as i32 {
             tracing::warn!(
@@ -429,8 +441,10 @@ unsafe fn disconnect_call_from_channel(
     // Disconnect from other calls in the channel (both directions)
     for &other_call_id in remaining_calls {
         if let Some(other_conf_port) = conf_ports.get(&other_call_id).map(|r| *r) {
-            pjmedia_conf_disconnect_port(conf, *conf_port as u32, *other_conf_port as u32);
-            pjmedia_conf_disconnect_port(conf, *other_conf_port as u32, *conf_port as u32);
+            unsafe {
+                pjmedia_conf_disconnect_port(conf, *conf_port as u32, *other_conf_port as u32);
+                pjmedia_conf_disconnect_port(conf, *other_conf_port as u32, *conf_port as u32);
+            }
             tracing::debug!(
                 "Disconnected call {} from call {} in channel {}",
                 call_id,
@@ -442,8 +456,10 @@ unsafe fn disconnect_call_from_channel(
 
     // Disconnect from channel port (both directions)
     if let Some(channel_slot) = get_channel_slot(channel_id) {
-        pjmedia_conf_disconnect_port(conf, *channel_slot as u32, *conf_port as u32);
-        pjmedia_conf_disconnect_port(conf, *conf_port as u32, *channel_slot as u32);
+        unsafe {
+            pjmedia_conf_disconnect_port(conf, *channel_slot as u32, *conf_port as u32);
+            pjmedia_conf_disconnect_port(conf, *conf_port as u32, *channel_slot as u32);
+        }
         tracing::debug!(
             "Disconnected channel {} slot {} <-> call {} (port {}) bidirectionally",
             channel_id,

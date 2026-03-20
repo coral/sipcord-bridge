@@ -24,7 +24,7 @@ pub unsafe fn get_conference_bridge() -> Option<*mut pjmedia_conf> {
     if master_port.is_null() {
         return None;
     }
-    let conf = (*master_port).port_data.pdata as *mut pjmedia_conf;
+    let conf = unsafe { (*master_port).port_data.pdata as *mut pjmedia_conf };
     if conf.is_null() {
         return None;
     }
@@ -38,18 +38,20 @@ pub unsafe fn get_conference_bridge() -> Option<*mut pjmedia_conf> {
 /// `frame` must be a valid, non-null pointer to a pjmedia_frame with a buffer
 /// large enough for SAMPLES_PER_FRAME i16 samples.
 pub unsafe fn fill_audio_frame(frame: *mut pjmedia_frame, samples: &[i16]) {
-    let frame_buf = (*frame).buf as *mut i16;
-    std::ptr::copy_nonoverlapping(samples.as_ptr(), frame_buf, samples.len());
-    // Pad with silence if we got fewer samples than a full frame
-    if samples.len() < SAMPLES_PER_FRAME {
-        std::ptr::write_bytes(
-            frame_buf.add(samples.len()),
-            0,
-            SAMPLES_PER_FRAME - samples.len(),
-        );
+    unsafe {
+        let frame_buf = (*frame).buf as *mut i16;
+        std::ptr::copy_nonoverlapping(samples.as_ptr(), frame_buf, samples.len());
+        // Pad with silence if we got fewer samples than a full frame
+        if samples.len() < SAMPLES_PER_FRAME {
+            std::ptr::write_bytes(
+                frame_buf.add(samples.len()),
+                0,
+                SAMPLES_PER_FRAME - samples.len(),
+            );
+        }
+        (*frame).size = (SAMPLES_PER_FRAME * 2) as pj_size_t;
+        (*frame).type_ = pjmedia_frame_type_PJMEDIA_FRAME_TYPE_AUDIO;
     }
-    (*frame).size = (SAMPLES_PER_FRAME * 2) as pj_size_t;
-    (*frame).type_ = pjmedia_frame_type_PJMEDIA_FRAME_TYPE_AUDIO;
 }
 
 /// Fill a pjmedia_frame with silence.
@@ -58,10 +60,12 @@ pub unsafe fn fill_audio_frame(frame: *mut pjmedia_frame, samples: &[i16]) {
 /// `frame` must be a valid, non-null pointer to a pjmedia_frame with a buffer
 /// large enough for SAMPLES_PER_FRAME i16 samples.
 pub unsafe fn fill_silence_frame(frame: *mut pjmedia_frame) {
-    let frame_buf = (*frame).buf as *mut u8;
-    std::ptr::write_bytes(frame_buf, 0, SAMPLES_PER_FRAME * 2);
-    (*frame).size = (SAMPLES_PER_FRAME * 2) as pj_size_t;
-    (*frame).type_ = pjmedia_frame_type_PJMEDIA_FRAME_TYPE_AUDIO;
+    unsafe {
+        let frame_buf = (*frame).buf as *mut u8;
+        std::ptr::write_bytes(frame_buf, 0, SAMPLES_PER_FRAME * 2);
+        (*frame).size = (SAMPLES_PER_FRAME * 2) as pj_size_t;
+        (*frame).type_ = pjmedia_frame_type_PJMEDIA_FRAME_TYPE_AUDIO;
+    }
 }
 
 /// No-op put_frame callback for ports that only produce audio.
@@ -119,14 +123,14 @@ pub unsafe fn create_and_connect_port(
 ) -> Result<ConfPortGuard> {
     // Get or create the memory pool
     let pool = pool.get_or_init(|| {
-        let p = pjsua_pool_create(pool_name.as_ptr() as *const _, 4096, 4096);
+        let p = unsafe { pjsua_pool_create(pool_name.as_ptr() as *const _, 4096, 4096) };
         Mutex::new(SendablePool(p))
     });
     let pool_ptr = pool.lock().0;
 
     // Allocate pjmedia_port structure
     let port_size = std::mem::size_of::<pjmedia_port>();
-    let port = pj_pool_alloc(pool_ptr, port_size) as *mut pjmedia_port;
+    let port = unsafe { pj_pool_alloc(pool_ptr, port_size) as *mut pjmedia_port };
     if port.is_null() {
         anyhow::bail!(
             "Failed to allocate {} port for call {}",
@@ -134,7 +138,7 @@ pub unsafe fn create_and_connect_port(
             call_id
         );
     }
-    std::ptr::write_bytes(port as *mut u8, 0, port_size);
+    unsafe { std::ptr::write_bytes(port as *mut u8, 0, port_size) };
 
     // Create port name
     let port_name = format!("{}{}", name_prefix, call_id);
@@ -142,38 +146,41 @@ pub unsafe fn create_and_connect_port(
         .map_err(|e| anyhow::anyhow!("Invalid port name: {}", e))?;
 
     // Initialize port info
-    pjmedia_port_info_init(
-        &mut (*port).info,
-        &pj_str(port_name_cstr.as_ptr() as *mut _),
-        signature,
-        CONF_SAMPLE_RATE,
-        CONF_CHANNELS,
-        16,
-        SAMPLES_PER_FRAME as u32,
-    );
+    unsafe {
+        pjmedia_port_info_init(
+            &mut (*port).info,
+            &pj_str(port_name_cstr.as_ptr() as *mut _),
+            signature,
+            CONF_SAMPLE_RATE,
+            CONF_CHANNELS,
+            16,
+            SAMPLES_PER_FRAME as u32,
+        );
 
-    // Set callbacks
-    (*port).get_frame = Some(callbacks.get_frame);
-    (*port).put_frame = Some(callbacks.put_frame);
-    (*port).on_destroy = callbacks.on_destroy;
+        // Set callbacks
+        (*port).get_frame = Some(callbacks.get_frame);
+        (*port).put_frame = Some(callbacks.put_frame);
+        (*port).on_destroy = callbacks.on_destroy;
+    }
 
     // Add to conference
     let mut player_slot: i32 = 0;
-    let status = pjsua_conf_add_port(pool_ptr, port, &mut player_slot);
+    let status = unsafe { pjsua_conf_add_port(pool_ptr, port, &mut player_slot) };
     if status != pj_constants__PJ_SUCCESS as i32 {
         anyhow::bail!("Failed to add {} port to conf: {}", name_prefix, status);
     }
 
     // Connect player port to the target call's port
-    let conf = get_conference_bridge();
+    let conf = unsafe { get_conference_bridge() };
     let Some(conf) = conf else {
-        pjsua_conf_remove_port(player_slot);
+        unsafe { pjsua_conf_remove_port(player_slot) };
         anyhow::bail!("Failed to get conference bridge for {} port", name_prefix);
     };
 
-    let status = pjmedia_conf_connect_port(conf, player_slot as u32, *call_conf_port as u32, 0);
+    let status =
+        unsafe { pjmedia_conf_connect_port(conf, player_slot as u32, *call_conf_port as u32, 0) };
     if status != pj_constants__PJ_SUCCESS as i32 {
-        pjsua_conf_remove_port(player_slot);
+        unsafe { pjsua_conf_remove_port(player_slot) };
         anyhow::bail!("Failed to connect {} port to call: {}", name_prefix, status);
     }
 

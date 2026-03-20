@@ -11,6 +11,10 @@ use std::collections::HashMap;
 
 /// Custom get_frame callback for direct player ports
 /// Returns samples from the player's buffer, advancing position each call
+///
+/// # Safety
+/// Called by the pjmedia conference bridge. `this_port` and `frame` must be
+/// valid, non-null pointers to pjmedia structures owned by pjsua.
 pub unsafe extern "C" fn direct_player_get_frame(
     this_port: *mut pjmedia_port,
     frame: *mut pjmedia_frame,
@@ -45,13 +49,13 @@ pub unsafe extern "C" fn direct_player_get_frame(
         if let Some((buffer, pos)) = state.get_mut(&port_key) {
             if *pos < buffer.len() {
                 let end = (*pos + SAMPLES_PER_FRAME).min(buffer.len());
-                super::frame_utils::fill_audio_frame(frame, &buffer[*pos..end]);
+                unsafe { super::frame_utils::fill_audio_frame(frame, &buffer[*pos..end]) };
                 *pos = end;
             } else {
-                super::frame_utils::fill_silence_frame(frame); // Playback complete
+                unsafe { super::frame_utils::fill_silence_frame(frame) }; // Playback complete
             }
         } else {
-            super::frame_utils::fill_silence_frame(frame);
+            unsafe { super::frame_utils::fill_silence_frame(frame) };
         }
     }
 
@@ -59,6 +63,10 @@ pub unsafe extern "C" fn direct_player_get_frame(
 }
 
 /// Custom on_destroy callback for direct player ports
+///
+/// # Safety
+/// Called by pjmedia when the port is being destroyed. `this_port` must be
+/// a valid pointer to a pjmedia_port that was previously created by this module.
 pub unsafe extern "C" fn direct_player_on_destroy(this_port: *mut pjmedia_port) -> pj_status_t {
     if !this_port.is_null() {
         let port_key = this_port as usize;

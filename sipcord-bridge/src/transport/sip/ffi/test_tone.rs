@@ -76,7 +76,7 @@ pub unsafe extern "C" fn test_tone_get_frame(
             }
 
             if tone_state.finished {
-                super::frame_utils::fill_silence_frame(frame);
+                unsafe { super::frame_utils::fill_silence_frame(frame) };
             } else {
                 // Copy from precomputed LUT with wraparound (two memcpy calls max)
                 let lut = tone_lut();
@@ -85,27 +85,29 @@ pub unsafe extern "C" fn test_tone_get_frame(
                 tone_state.phase += SAMPLES_PER_FRAME as u64;
 
                 let first_chunk = (lut_len - phase).min(SAMPLES_PER_FRAME);
-                let frame_buf = (*frame).buf as *mut i16;
-                std::ptr::copy_nonoverlapping(
-                    lut[phase..phase + first_chunk].as_ptr(),
-                    frame_buf,
-                    first_chunk,
-                );
-
-                if first_chunk < SAMPLES_PER_FRAME {
-                    let remaining = SAMPLES_PER_FRAME - first_chunk;
+                unsafe {
+                    let frame_buf = (*frame).buf as *mut i16;
                     std::ptr::copy_nonoverlapping(
-                        lut.as_ptr(),
-                        frame_buf.add(first_chunk),
-                        remaining,
+                        lut[phase..phase + first_chunk].as_ptr(),
+                        frame_buf,
+                        first_chunk,
                     );
-                }
 
-                (*frame).size = (SAMPLES_PER_FRAME * 2) as pj_size_t;
-                (*frame).type_ = pjmedia_frame_type_PJMEDIA_FRAME_TYPE_AUDIO;
+                    if first_chunk < SAMPLES_PER_FRAME {
+                        let remaining = SAMPLES_PER_FRAME - first_chunk;
+                        std::ptr::copy_nonoverlapping(
+                            lut.as_ptr(),
+                            frame_buf.add(first_chunk),
+                            remaining,
+                        );
+                    }
+
+                    (*frame).size = (SAMPLES_PER_FRAME * 2) as pj_size_t;
+                    (*frame).type_ = pjmedia_frame_type_PJMEDIA_FRAME_TYPE_AUDIO;
+                }
             }
         } else {
-            super::frame_utils::fill_silence_frame(frame);
+            unsafe { super::frame_utils::fill_silence_frame(frame) };
         }
     }
 
