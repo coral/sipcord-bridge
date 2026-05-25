@@ -1,6 +1,6 @@
 [package]
 name = "pjsua"
-version = "2.1.1"
+version = "2.1.2"
 edition = "2024"
 description = "Rust bindings for pjsua (pjproject SIP library)"
 publish = false
