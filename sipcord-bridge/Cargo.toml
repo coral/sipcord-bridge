@@ -1,6 +1,6 @@
 [package]
 name = "sipcord-bridge"
-version = "2.1.0"
+version = "2.1.1"
 edition = "2024"
 authors = ["coral <jonas@jonasbengtson.se>"]
 license = "AGPL-3.0-only"
