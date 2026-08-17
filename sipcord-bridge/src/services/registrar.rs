@@ -24,8 +24,9 @@ pub enum SipTransport {
 #[derive(Debug, Clone)]
 pub struct Registration {
     pub sip_username: String,
-    /// None if user has allow_inbound_calls disabled
-    pub discord_username: Option<String>,
+    /// Stable Discord user snowflake. Display names are deliberately not used
+    /// for routing because they can change while a phone remains registered.
+    pub discord_user_id: String,
     /// From Contact header (client-advertised URI)
     pub contact_uri: String,
     /// Actual transport source (for NAT traversal)
@@ -42,8 +43,8 @@ pub struct Registration {
 pub struct Registrar {
     /// SIP username -> list of registrations (multiple phones per user)
     registrations: DashMap<String, Vec<Registration>>,
-    /// Discord username -> SIP username (reverse lookup for inbound calls)
-    discord_to_sip: DashMap<String, String>,
+    /// Discord user ID -> SIP username (reverse lookup for inbound calls)
+    user_to_sip: DashMap<String, String>,
 }
 
 impl Default for Registrar {
@@ -56,14 +57,14 @@ impl Registrar {
     pub fn new() -> Self {
         Self {
             registrations: DashMap::new(),
-            discord_to_sip: DashMap::new(),
+            user_to_sip: DashMap::new(),
         }
     }
 
     /// Add or update a registration.
     pub fn add_registration(&self, reg: Registration) {
         let sip_username = reg.sip_username.clone();
-        let discord_username = reg.discord_username.clone();
+        let discord_user_id = reg.discord_user_id.clone();
 
         // Update or insert into registrations
         let mut regs = self.registrations.entry(sip_username.clone()).or_default();
@@ -73,21 +74,19 @@ impl Registrar {
             .iter_mut()
             .find(|r| r.source_addr == reg.source_addr && r.contact_uri == reg.contact_uri)
         {
-            // If discord_username changed, remove the old reverse mapping
-            if existing.discord_username != reg.discord_username
-                && let Some(ref old_du) = existing.discord_username
-            {
-                self.discord_to_sip.remove(old_du);
-            }
+            let old_user_id = existing.discord_user_id.clone();
 
             existing.expires_at = reg.expires_at;
             existing.registered_at = reg.registered_at;
             existing.contact_uri = reg.contact_uri.clone();
-            existing.discord_username = reg.discord_username.clone();
+            existing.discord_user_id = reg.discord_user_id.clone();
+            let user_changed = old_user_id != existing.discord_user_id;
 
-            // Update reverse lookup if discord_username is set
-            if let Some(ref du) = discord_username {
-                self.discord_to_sip.insert(du.clone(), sip_username.clone());
+            drop(regs);
+            self.user_to_sip
+                .insert(discord_user_id, sip_username.clone());
+            if user_changed {
+                self.remove_user_mapping_if_unused(&old_user_id, &sip_username);
             }
 
             return;
@@ -96,10 +95,7 @@ impl Registrar {
         regs.push(reg);
         drop(regs);
 
-        // Update reverse lookup
-        if let Some(ref du) = discord_username {
-            self.discord_to_sip.insert(du.clone(), sip_username.clone());
-        }
+        self.user_to_sip.insert(discord_user_id, sip_username);
     }
 
     /// Remove expired registrations.
@@ -117,7 +113,8 @@ impl Registrar {
 
         for sip_username in to_clean {
             if let Some(mut regs) = self.registrations.get_mut(&sip_username) {
-                let discord_username_before = regs.iter().find_map(|r| r.discord_username.clone());
+                let user_ids_before: Vec<String> =
+                    regs.iter().map(|r| r.discord_user_id.clone()).collect();
 
                 regs.retain(|r| r.expires_at > now);
 
@@ -125,9 +122,8 @@ impl Registrar {
                     drop(regs);
                     self.registrations.remove(&sip_username);
 
-                    // Clean up reverse lookup
-                    if let Some(du) = discord_username_before {
-                        self.discord_to_sip.remove(&du);
+                    for user_id in user_ids_before {
+                        self.remove_user_mapping_if_unused(&user_id, &sip_username);
                     }
                 }
             }
@@ -148,11 +144,11 @@ impl Registrar {
     }
 
     /// Get contacts for a Discord user (for inbound calling)
-    pub fn get_contacts_for_discord_user(
+    pub fn get_contacts_for_discord_user_id(
         &self,
-        discord_username: &str,
+        discord_user_id: &str,
     ) -> Vec<(String, SocketAddr, SipTransport)> {
-        let sip_username = match self.discord_to_sip.get(discord_username) {
+        let sip_username = match self.user_to_sip.get(discord_user_id) {
             Some(entry) => entry.value().clone(),
             None => return Vec::new(),
         };
@@ -161,10 +157,25 @@ impl Registrar {
         match self.registrations.get(&sip_username) {
             Some(regs) => regs
                 .iter()
-                .filter(|r| r.expires_at > now)
+                .filter(|r| r.expires_at > now && r.discord_user_id == discord_user_id)
                 .map(|r| (r.contact_uri.clone(), r.source_addr, r.transport))
                 .collect(),
             None => Vec::new(),
+        }
+    }
+
+    fn remove_user_mapping_if_unused(&self, discord_user_id: &str, sip_username: &str) {
+        let still_registered = self
+            .registrations
+            .get(sip_username)
+            .is_some_and(|regs| regs.iter().any(|r| r.discord_user_id == discord_user_id));
+        if !still_registered
+            && self
+                .user_to_sip
+                .get(discord_user_id)
+                .is_some_and(|mapped| mapped.value() == sip_username)
+        {
+            self.user_to_sip.remove(discord_user_id);
         }
     }
 }
@@ -188,14 +199,14 @@ mod tests {
 
     fn make_reg(
         sip_user: &str,
-        discord_user: Option<&str>,
+        discord_user_id: &str,
         addr: &str,
         contact: &str,
         expires_secs: u64,
     ) -> Registration {
         Registration {
             sip_username: sip_user.to_string(),
-            discord_username: discord_user.map(|s| s.to_string()),
+            discord_user_id: discord_user_id.to_string(),
             contact_uri: contact.to_string(),
             source_addr: addr.parse::<SocketAddr>().unwrap(),
             transport: SipTransport::Udp,
@@ -209,7 +220,7 @@ mod tests {
         let reg = Registrar::new();
         reg.add_registration(make_reg(
             "alice",
-            None,
+            "1001",
             "1.2.3.4:5060",
             "sip:alice@1.2.3.4",
             300,
@@ -224,12 +235,12 @@ mod tests {
         let reg = Registrar::new();
         reg.add_registration(make_reg(
             "bob",
-            Some("bob#1234"),
+            "1002",
             "5.6.7.8:5060",
             "sip:bob@5.6.7.8",
             300,
         ));
-        let contacts = reg.get_contacts_for_discord_user("bob#1234");
+        let contacts = reg.get_contacts_for_discord_user_id("1002");
         assert_eq!(contacts.len(), 1);
         assert_eq!(contacts[0].0, "sip:bob@5.6.7.8");
     }
@@ -239,7 +250,7 @@ mod tests {
         let reg = Registrar::new();
         reg.add_registration(make_reg(
             "alice",
-            None,
+            "1001",
             "1.2.3.4:5060",
             "sip:alice@1.2.3.4",
             300,
@@ -247,7 +258,7 @@ mod tests {
         // Same source_addr + contact_uri -> update in place
         reg.add_registration(make_reg(
             "alice",
-            None,
+            "1001",
             "1.2.3.4:5060",
             "sip:alice@1.2.3.4",
             600,
@@ -261,14 +272,14 @@ mod tests {
         let reg = Registrar::new();
         reg.add_registration(make_reg(
             "alice",
-            None,
+            "1001",
             "1.2.3.4:5060",
             "sip:alice@1.2.3.4",
             300,
         ));
         reg.add_registration(make_reg(
             "alice",
-            None,
+            "1001",
             "5.6.7.8:5060",
             "sip:alice@5.6.7.8",
             300,
@@ -281,13 +292,14 @@ mod tests {
     fn test_remove_expired() {
         let reg = Registrar::new();
         // Add one that expires immediately
-        let mut expired_reg = make_reg("alice", None, "1.2.3.4:5060", "sip:alice@1.2.3.4", 0);
+        let mut expired_reg =
+            make_reg("alice", "1001", "1.2.3.4:5060", "sip:alice@1.2.3.4", 0);
         expired_reg.expires_at = Instant::now() - Duration::from_secs(1);
         reg.add_registration(expired_reg);
         // Add one that's still valid
         reg.add_registration(make_reg(
             "alice",
-            None,
+            "1001",
             "5.6.7.8:5060",
             "sip:alice@5.6.7.8",
             300,
@@ -304,7 +316,7 @@ mod tests {
         let reg = Registrar::new();
         let mut expired_reg = make_reg(
             "charlie",
-            Some("charlie#0001"),
+            "1003",
             "1.2.3.4:5060",
             "sip:charlie@1.2.3.4",
             0,
@@ -314,14 +326,36 @@ mod tests {
 
         reg.add_registration(make_reg(
             "charlie",
-            Some("charlie#0001"),
+            "1003",
             "5.6.7.8:5060",
             "sip:charlie@5.6.7.8",
             300,
         ));
 
-        let contacts = reg.get_contacts_for_discord_user("charlie#0001");
+        let contacts = reg.get_contacts_for_discord_user_id("1003");
         assert_eq!(contacts.len(), 1);
         assert_eq!(contacts[0].0, "sip:charlie@5.6.7.8");
+    }
+
+    #[test]
+    fn expiring_one_phone_preserves_other_contacts() {
+        let reg = Registrar::new();
+        let mut expired =
+            make_reg("alice", "1001", "1.2.3.4:5060", "sip:alice@1.2.3.4", 0);
+        expired.expires_at = Instant::now() - Duration::from_secs(1);
+        reg.add_registration(expired);
+        reg.add_registration(make_reg(
+            "alice",
+            "1001",
+            "5.6.7.8:5060",
+            "sip:alice@5.6.7.8",
+            300,
+        ));
+
+        reg.remove_expired();
+
+        let contacts = reg.get_contacts_for_discord_user_id("1001");
+        assert_eq!(contacts.len(), 1);
+        assert_eq!(contacts[0].1, "5.6.7.8:5060".parse().unwrap());
     }
 }

@@ -20,7 +20,9 @@ use serde::Deserialize;
 use tracing::info;
 
 use crate::config::ConfigError;
-use crate::routing::{Backend, CallError, CallStartedInfo, OutboundCallRequest, RouteDecision};
+use crate::routing::{
+    Backend, CallError, CallStartedInfo, OutboundCallCommand, OutboundCallStatus, RouteDecision,
+};
 use crate::services::snowflake::Snowflake;
 use crate::transport::sip::DigestAuthParams;
 
@@ -112,9 +114,9 @@ impl Backend for StaticBackend {
 
     async fn heartbeat(&self, _active_channel_ids: &[String]) {}
 
-    fn report_call_status(&self, _call_id: &str, _status: &str) {}
+    fn report_call_status(&self, _call_id: &str, _status: OutboundCallStatus) {}
 
-    async fn next_outbound_request(&self) -> Option<OutboundCallRequest> {
+    async fn next_outbound_command(&self) -> Option<OutboundCallCommand> {
         // Static router doesn't support outbound calls — block forever
         std::future::pending().await
     }

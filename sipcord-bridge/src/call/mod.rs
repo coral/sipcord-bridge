@@ -16,7 +16,10 @@
 
 use crate::fax::session::FaxSession;
 use crate::fax::spandsp::FaxT38Receiver;
-use crate::routing::{Backend, CallError, CallStartedInfo, OutboundCallRequest, RouteDecision};
+use crate::routing::{
+    Backend, CallError, CallStartedInfo, OutboundCallCommand, OutboundCallFailureReason,
+    OutboundCallRequest, OutboundCallStatus, RouteDecision,
+};
 use crate::services::snowflake::Snowflake;
 use crate::services::sound::{SoundManager, create_sound_manager};
 use crate::transport::discord::{
@@ -43,6 +46,50 @@ use udptl::AsyncUdptlSocket;
 
 /// Type alias for fax session entries stored in the DashMap.
 type FaxSessionEntry = (Arc<tokio::sync::Mutex<FaxSession>>, CancellationToken);
+
+fn classify_failure_reason(reason: &str) -> OutboundCallFailureReason {
+    let reason = reason.to_ascii_lowercase();
+    if reason.contains("486") || reason.contains("busy") {
+        OutboundCallFailureReason::Busy
+    } else if reason.contains("603") || reason.contains("declin") || reason.contains("reject") {
+        OutboundCallFailureReason::Declined
+    } else if reason.contains("408")
+        || reason.contains("480")
+        || reason.contains("timeout")
+        || reason.contains("no answer")
+    {
+        OutboundCallFailureReason::NoAnswer
+    } else if reason.contains("transport") || reason.contains("503") || reason.contains("502") {
+        OutboundCallFailureReason::Transport
+    } else {
+        OutboundCallFailureReason::Internal
+    }
+}
+
+#[cfg(test)]
+mod outbound_failure_tests {
+    use super::*;
+
+    #[test]
+    fn classifies_common_sip_failures() {
+        assert_eq!(
+            classify_failure_reason("486 Busy Here"),
+            OutboundCallFailureReason::Busy
+        );
+        assert_eq!(
+            classify_failure_reason("603 Decline"),
+            OutboundCallFailureReason::Declined
+        );
+        assert_eq!(
+            classify_failure_reason("408 Request Timeout"),
+            OutboundCallFailureReason::NoAnswer
+        );
+        assert_eq!(
+            classify_failure_reason("503 Service Unavailable"),
+            OutboundCallFailureReason::Transport
+        );
+    }
+}
 
 /// Ring buffer capacity for Discord→SIP audio (i16 mono @ 16kHz).
 /// 3200 samples = 200ms of audio, enough for timing jitter.
@@ -268,6 +315,12 @@ impl BridgeCoordinator {
                     }
 
                     SipEvent::CallEnded { call_id } => {
+                        if let Some(call_info) = sip_calls.get(&call_id)
+                            && let Some(ref tracking_id) = call_info.tracking_id
+                        {
+                            backend_for_sip
+                                .report_call_status(tracking_id, OutboundCallStatus::Ended);
+                        }
                         unregister_call_channel(call_id);
                         stop_loop(call_id);
 
@@ -376,7 +429,8 @@ impl BridgeCoordinator {
                                 "Call {} had zero RTP packets, reporting no_audio (tracking_id={})",
                                 call_id, tracking_id
                             );
-                            backend_for_sip.report_call_status(tracking_id, "no_audio");
+                            backend_for_sip
+                                .report_call_status(tracking_id, OutboundCallStatus::NoAudio);
                         }
 
                         let _ = sip_cmd_tx.send(SipCommand::Hangup { call_id });
@@ -407,7 +461,8 @@ impl BridgeCoordinator {
                             }
                         }
 
-                        backend_for_sip.report_call_status(&tracking_id, "answered");
+                        backend_for_sip
+                            .report_call_status(&tracking_id, OutboundCallStatus::Answered);
 
                         let ctx = ctx.clone();
                         let outbound_requests = outbound_requests.clone();
@@ -446,7 +501,10 @@ impl BridgeCoordinator {
                                 tracking_id
                             );
                             outbound_requests.remove(&tracking_id);
-                            backend_for_sip.report_call_status(&tracking_id, "failed");
+                            backend_for_sip.report_call_status(
+                                &tracking_id,
+                                OutboundCallStatus::Failed(classify_failure_reason(&reason)),
+                            );
                         } else {
                             debug!(
                                 "Fork leg failed but other legs still active for tracking_id={}",
@@ -514,17 +572,42 @@ impl BridgeCoordinator {
         let outbound_sip_cmd_tx = self.sip_cmd_tx.clone();
         let outbound_registrar = crate::services::registrar::GLOBAL_REGISTRAR.get().cloned();
         let outbound_requests_for_handler = self.outbound_requests.clone();
+        let outbound_sip_calls = self.sip_calls.clone();
 
         let outbound_handle = tokio::spawn(async move {
-            while let Some(req) = outbound_backend.next_outbound_request().await {
+            while let Some(command) = outbound_backend.next_outbound_command().await {
+                let req = match command {
+                    OutboundCallCommand::Start(req) => req,
+                    OutboundCallCommand::Cancel { call_id } => {
+                        outbound_requests_for_handler.remove(&call_id);
+
+                        for leg_id in crate::transport::sip::fork_group::cancel(&call_id) {
+                            crate::transport::sip::remove_outbound_tracking(leg_id);
+                            let _ = outbound_sip_cmd_tx.send(SipCommand::Hangup { call_id: leg_id });
+                        }
+
+                        let connected_legs: Vec<CallId> = outbound_sip_calls
+                            .iter()
+                            .filter_map(|entry| {
+                                (entry.value().tracking_id.as_deref() == Some(call_id.as_str()))
+                                    .then_some(*entry.key())
+                            })
+                            .collect();
+                        for leg_id in connected_legs {
+                            crate::transport::sip::remove_outbound_tracking(leg_id);
+                            let _ = outbound_sip_cmd_tx.send(SipCommand::Hangup { call_id: leg_id });
+                        }
+                        continue;
+                    }
+                };
                 info!(
-                    "Processing outbound call request: call_id={}, user={}",
-                    req.call_id, req.discord_username
+                    "Processing outbound call request: call_id={}, user_id={}, user={}",
+                    req.call_id, req.discord_user_id, req.discord_username
                 );
 
                 // Look up the user's SIP contact from the registrar
                 let contacts = if let Some(ref registrar) = outbound_registrar {
-                    registrar.get_contacts_for_discord_user(&req.discord_username)
+                    registrar.get_contacts_for_discord_user_id(&req.discord_user_id)
                 } else {
                     Vec::new()
                 };
@@ -534,7 +617,8 @@ impl BridgeCoordinator {
                         "No SIP contacts for user {} (call_id={})",
                         req.discord_username, req.call_id
                     );
-                    outbound_backend.report_call_status(&req.call_id, "failed");
+                    outbound_backend
+                        .report_call_status(&req.call_id, OutboundCallStatus::Unavailable);
                     continue;
                 }
 
@@ -577,7 +661,7 @@ impl BridgeCoordinator {
                     });
                 }
 
-                outbound_backend.report_call_status(&req.call_id, "ringing");
+                outbound_backend.report_call_status(&req.call_id, OutboundCallStatus::Ringing);
             }
         });
 
@@ -643,6 +727,7 @@ impl BridgeCoordinator {
                 if swept > 0 {
                     warn!("Swept {} stale outbound requests (>60s old)", swept);
                 }
+                crate::transport::sip::fork_group::cleanup_resolved(Duration::from_secs(120));
 
                 let active_channel_ids: Vec<String> = bridges
                     .iter()
@@ -1389,7 +1474,10 @@ async fn handle_outbound_call_answered(
                 "Invalid guild_id '{}' in outbound request: {}",
                 req.guild_id, e
             );
-            backend.report_call_status(&req.call_id, "failed");
+            backend.report_call_status(
+                &req.call_id,
+                OutboundCallStatus::Failed(OutboundCallFailureReason::Internal),
+            );
             let _ = sip_cmd_tx.send(SipCommand::Hangup { call_id });
             return;
         }
@@ -1401,7 +1489,10 @@ async fn handle_outbound_call_answered(
                 "Invalid channel_id '{}' in outbound request: {}",
                 req.channel_id, e
             );
-            backend.report_call_status(&req.call_id, "failed");
+            backend.report_call_status(
+                &req.call_id,
+                OutboundCallStatus::Failed(OutboundCallFailureReason::Internal),
+            );
             let _ = sip_cmd_tx.send(SipCommand::Hangup { call_id });
             return;
         }
@@ -1454,7 +1545,10 @@ async fn handle_outbound_call_answered(
             "Guild {} already has active bridge to channel {} (outbound call {} tried channel {})",
             guild_id, existing_channel_id, call_id, channel_id
         );
-        backend.report_call_status(&req.call_id, "failed");
+        backend.report_call_status(
+            &req.call_id,
+            OutboundCallStatus::Failed(OutboundCallFailureReason::Internal),
+        );
         let _ = sip_cmd_tx.send(SipCommand::Hangup { call_id });
         sip_calls.remove(&call_id);
         return;
@@ -1525,6 +1619,7 @@ async fn handle_outbound_call_answered(
                 }
 
                 register_call_channel(call_id, channel_id);
+                backend.report_call_status(&req.call_id, OutboundCallStatus::Connected);
                 play_discord_join(call_id, &sound_manager, &sip_cmd_tx).await;
             }
             Err(e) => {
@@ -1534,7 +1629,10 @@ async fn handle_outbound_call_answered(
                     "Failed to connect to Discord for outbound call {}: {}",
                     call_id, e
                 );
-                backend.report_call_status(&req.call_id, "failed");
+                backend.report_call_status(
+                    &req.call_id,
+                    OutboundCallStatus::Failed(OutboundCallFailureReason::Internal),
+                );
                 let _ = sip_cmd_tx.send(SipCommand::Hangup { call_id });
                 sip_calls.remove(&call_id);
             }

@@ -319,7 +319,7 @@ fn run_pjsua_loop(
         // Process any pending SIP commands (non-blocking)
         // These must be processed in the PJSUA thread to avoid deadlocks
         while let Ok(cmd) = command_rx.try_recv() {
-            process_sip_command(cmd, &calls);
+            process_sip_command(cmd, &calls, &event_tx);
         }
 
         // Sleep briefly to allow PJSIP worker threads to process events
@@ -352,7 +352,11 @@ fn run_pjsua_loop(
 /// Process a SIP command in the PJSUA thread
 ///
 /// This must be called from the PJSUA event loop thread to avoid deadlocks.
-fn process_sip_command(cmd: SipCommand, calls: &Arc<DashMap<CallId, CallState>>) {
+fn process_sip_command(
+    cmd: SipCommand,
+    calls: &Arc<DashMap<CallId, CallState>>,
+    event_tx: &Sender<SipEvent>,
+) {
     match cmd {
         SipCommand::PlayDirectToCall { call_id, samples } => {
             // Play audio directly to a call (bypasses channel buffer)
@@ -419,7 +423,11 @@ fn process_sip_command(cmd: SipCommand, calls: &Arc<DashMap<CallId, CallState>>)
                     let outbound_calls = OUTBOUND_CALL_TRACKING.get_or_init(DashMap::new);
                     outbound_calls.insert(call_id, tracking_id.clone());
                     // Register in fork group
-                    fork_group::add_member(&tracking_id, call_id, fork_total);
+                    if !fork_group::add_member(&tracking_id, call_id, fork_total) {
+                        outbound_calls.remove(&call_id);
+                        hangup_call(call_id);
+                        return;
+                    }
                     info!(
                         "Outbound call started: tracking_id={}, call_id={}",
                         tracking_id, call_id
@@ -432,7 +440,13 @@ fn process_sip_command(cmd: SipCommand, calls: &Arc<DashMap<CallId, CallState>>)
                         tracking_id, e
                     );
                     // Track the initial failure in fork group
-                    fork_group::add_initial_failure(&tracking_id, fork_total);
+                    if fork_group::add_initial_failure(&tracking_id, fork_total) {
+                        let _ = event_tx.send(SipEvent::OutboundCallFailed {
+                            tracking_id,
+                            call_id: None,
+                            reason: format!("outbound call setup failed: {e}"),
+                        });
+                    }
                 }
             }
         }

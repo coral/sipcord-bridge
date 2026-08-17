@@ -8,12 +8,40 @@ use async_trait::async_trait;
 #[derive(Debug, Clone)]
 pub struct OutboundCallRequest {
     pub call_id: String,
+    pub discord_user_id: String,
+    /// Display-only username used in logs and SIP caller context.
     pub discord_username: String,
     pub guild_id: String,
     pub channel_id: String,
     pub bot_token: String,
     pub caller_username: String,
     pub created_at: std::time::Instant,
+}
+
+#[derive(Debug, Clone)]
+pub enum OutboundCallCommand {
+    Start(OutboundCallRequest),
+    Cancel { call_id: String },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutboundCallFailureReason {
+    Busy,
+    Declined,
+    NoAnswer,
+    Transport,
+    Internal,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutboundCallStatus {
+    Unavailable,
+    Ringing,
+    Answered,
+    Connected,
+    Failed(OutboundCallFailureReason),
+    NoAudio,
+    Ended,
 }
 
 /// Result of routing an incoming SIP call
@@ -99,8 +127,8 @@ pub trait Backend: Send + Sync {
     async fn heartbeat(&self, active_channel_ids: &[String]);
 
     /// Report outbound call status back to the backend
-    fn report_call_status(&self, call_id: &str, status: &str);
+    fn report_call_status(&self, call_id: &str, status: OutboundCallStatus);
 
-    /// Get the next outbound call request (None if backend doesn't support outbound)
-    async fn next_outbound_request(&self) -> Option<OutboundCallRequest>;
+    /// Get the next outbound call command (None if backend doesn't support outbound)
+    async fn next_outbound_command(&self) -> Option<OutboundCallCommand>;
 }

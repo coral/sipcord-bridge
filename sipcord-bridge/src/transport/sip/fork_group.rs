@@ -9,13 +9,19 @@ use super::CallId;
 use dashmap::DashMap;
 use std::collections::HashSet;
 use std::sync::OnceLock;
+use std::time::{Duration, Instant};
 use tracing::{debug, info};
 
 /// Global fork group registry, keyed by tracking_id.
 static FORK_GROUPS: OnceLock<DashMap<String, ForkGroup>> = OnceLock::new();
+static RESOLVED_GROUPS: OnceLock<DashMap<String, Instant>> = OnceLock::new();
 
 fn groups() -> &'static DashMap<String, ForkGroup> {
     FORK_GROUPS.get_or_init(DashMap::new)
+}
+
+fn resolved_groups() -> &'static DashMap<String, Instant> {
+    RESOLVED_GROUPS.get_or_init(DashMap::new)
 }
 
 struct ForkGroup {
@@ -34,7 +40,10 @@ struct ForkGroup {
 /// Register a successfully started call leg in a fork group.
 ///
 /// Called from `process_sip_command` after `make_outbound_call` succeeds.
-pub fn add_member(tracking_id: &str, call_id: CallId, fork_total: usize) {
+pub fn add_member(tracking_id: &str, call_id: CallId, fork_total: usize) -> bool {
+    if resolved_groups().contains_key(tracking_id) {
+        return false;
+    }
     let mut entry = groups()
         .entry(tracking_id.to_string())
         .or_insert_with(|| ForkGroup {
@@ -44,6 +53,11 @@ pub fn add_member(tracking_id: &str, call_id: CallId, fork_total: usize) {
             answered_call_id: None,
             expected_total: fork_total,
         });
+    if resolved_groups().contains_key(tracking_id) {
+        drop(entry);
+        groups().remove(tracking_id);
+        return false;
+    }
     entry.sibling_call_ids.insert(call_id);
     debug!(
         "Fork group {}: added call_id={}, members={}/{}",
@@ -52,12 +66,16 @@ pub fn add_member(tracking_id: &str, call_id: CallId, fork_total: usize) {
         entry.sibling_call_ids.len() + entry.initial_failures,
         fork_total
     );
+    true
 }
 
 /// Track a call that failed to start (make_outbound_call returned error).
 ///
 /// Called from `process_sip_command` when `make_outbound_call` fails.
-pub fn add_initial_failure(tracking_id: &str, fork_total: usize) {
+pub fn add_initial_failure(tracking_id: &str, fork_total: usize) -> bool {
+    if resolved_groups().contains_key(tracking_id) {
+        return false;
+    }
     let mut entry = groups()
         .entry(tracking_id.to_string())
         .or_insert_with(|| ForkGroup {
@@ -74,6 +92,13 @@ pub fn add_initial_failure(tracking_id: &str, fork_total: usize) {
         entry.initial_failures + entry.failed_call_ids.len(),
         fork_total
     );
+    let all_failed = entry.initial_failures + entry.failed_call_ids.len() >= entry.expected_total;
+    if all_failed {
+        drop(entry);
+        resolved_groups().insert(tracking_id.to_string(), Instant::now());
+        groups().remove(tracking_id);
+    }
+    all_failed
 }
 
 /// Mark a fork leg as answered. Returns the sibling call_ids to cancel (if this
@@ -81,6 +106,7 @@ pub fn add_initial_failure(tracking_id: &str, fork_total: usize) {
 ///
 /// The fork group is removed after this call since the logical call is resolved.
 pub fn mark_answered(tracking_id: &str, call_id: CallId) -> Option<Vec<CallId>> {
+    resolved_groups().insert(tracking_id.to_string(), Instant::now());
     // Use remove to get exclusive ownership - prevents races between two simultaneous answers
     let (_, mut group) = groups().remove(tracking_id)?;
 
@@ -151,10 +177,30 @@ pub fn mark_failed(tracking_id: &str, call_id: CallId) -> bool {
     if all_failed {
         // Drop the mutable ref before removing
         drop(entry);
+        resolved_groups().insert(tracking_id.to_string(), Instant::now());
         groups().remove(tracking_id);
     }
 
     all_failed
+}
+
+/// Remove an unresolved fork group and return every live leg to hang up.
+/// Repeated cancellation is intentionally a no-op.
+pub fn cancel(tracking_id: &str) -> Vec<CallId> {
+    resolved_groups().insert(tracking_id.to_string(), Instant::now());
+    let Some((_, group)) = groups().remove(tracking_id) else {
+        return Vec::new();
+    };
+    group
+        .sibling_call_ids
+        .into_iter()
+        .filter(|id| !group.failed_call_ids.contains(id))
+        .collect()
+}
+
+/// Bound resolved-call tombstones used to reject late fork legs.
+pub fn cleanup_resolved(max_age: Duration) {
+    resolved_groups().retain(|_, resolved_at| resolved_at.elapsed() < max_age);
 }
 
 #[cfg(test)]
@@ -245,6 +291,14 @@ mod tests {
     }
 
     #[test]
+    fn test_all_initial_failures_resolve_group() {
+        let tid = unique_id("all_initial_fail");
+        assert!(!add_initial_failure(&tid, 2));
+        assert!(add_initial_failure(&tid, 2));
+        assert!(cancel(&tid).is_empty());
+    }
+
+    #[test]
     fn test_single_member_fork_group() {
         let tid = unique_id("single");
         let c1 = CallId::new(600);
@@ -254,6 +308,27 @@ mod tests {
         // Single member answers -> empty siblings list
         let siblings = mark_answered(&tid, c1).unwrap();
         assert!(siblings.is_empty());
+    }
+
+    #[test]
+    fn cancel_is_idempotent() {
+        let tid = unique_id("cancel");
+        let c1 = CallId::new(700);
+        let c2 = CallId::new(701);
+        add_member(&tid, c1, 2);
+        add_member(&tid, c2, 2);
+
+        let cancelled = cancel(&tid);
+        assert_eq!(cancelled.len(), 2);
+        assert!(cancel(&tid).is_empty());
+        assert!(!mark_failed(&tid, c1));
+    }
+
+    #[test]
+    fn cancel_rejects_late_fork_members() {
+        let tid = unique_id("cancel_before_member");
+        assert!(cancel(&tid).is_empty());
+        assert!(!add_member(&tid, CallId::new(710), 1));
     }
 
     #[test]

@@ -28,9 +28,14 @@ serenity = { git = "https://github.com/serenity-rs/serenity", default-features =
     "voice",
     "model",
     "framework",
-] , branch = "next"}
-songbird = { version = "0.5.0", git = "https://github.com/jtscuba/songbird", features = ["driver", "gateway", "receive", "tungstenite"] , branch = "davey" }
-poise = { version = "0.6.1", git = "https://github.com/serenity-rs/poise", branch = "serenity-next"}
+], branch = "next" }
+songbird = { git = "https://github.com/serenity-rs/songbird", branch = "serenity-next", features = [
+    "driver",
+    "gateway",
+    "receive",
+    "tungstenite",
+] }
+poise = { version = "0.6.1", git = "https://github.com/serenity-rs/poise", branch = "serenity-next" }
 
 # HTTP client for API calls
 reqwest = { version = "0.13.1", default-features = false, features = [
@@ -45,12 +50,12 @@ serde_json = "1.0.149"
 
 # Audio processing
 audiopus = "0.3.0-rc.0"
-rubato = "1.0.1"
-audioadapter = "2.0.0"
-audioadapter-buffers = "2.0.0"
+rubato = "3.0.0"
+audioadapter = "3.0.0"
+audioadapter-buffers = "3.0.0"
 
 # Symphonia with PCM codec for RawAdapter support in Songbird
-symphonia = { version = "0.5.5", default-features = false, features = [
+symphonia = { version = "0.5", default-features = false, features = [
     "pcm",
     "flac",
 ] }
@@ -90,19 +95,19 @@ parking_lot = "0.12.5"
 crossbeam-channel = "0.5.15"
 bytes = "1.11.1"
 byteorder = "1.5.0"
-symphonia-core = "0.5.5"
+symphonia-core = "0.5"
 dashmap = "6.1.0"
 moka = { version = "0.12.13", features = ["sync"] }
 
 # Crypto (MD5 for SIP digest auth cache verification, rand for nonces)
-md-5 = "0.10"
-rand = "0.9"
+md-5 = "0.11"
+rand = "0.10.1"
 
 # Configuration
 dotenvy = "0.15.7"
 envy = "0.4"
 base64 = "0.22.1"
-toml = "0.9.11"
+toml = "1.1.2"
 
 # Date/time handling
 chrono = { version = "0.4.43", features = ["serde"] }

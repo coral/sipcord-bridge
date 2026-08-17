@@ -31,8 +31,8 @@ pub enum VerifyResult {
 #[derive(Clone, Debug)]
 pub struct RegisterData {
     pub sip_username: String,
-    /// None if user has allow_inbound_calls disabled
-    pub discord_username: Option<String>,
+    /// Stable Discord snowflake used for inbound `/call` routing.
+    pub discord_user_id: String,
     /// Pre-computed HA1 hash for caching
     pub ha1: Option<String>,
 }
@@ -143,7 +143,13 @@ impl AuthCache {
 fn md5_hex(input: &str) -> String {
     let mut hasher = Md5::new();
     hasher.update(input.as_bytes());
-    format!("{:x}", hasher.finalize())
+    let digest = hasher.finalize();
+    let mut out = String::with_capacity(digest.len() * 2);
+    for b in digest.iter() {
+        use std::fmt::Write;
+        let _ = write!(out, "{:02x}", b);
+    }
+    out
 }
 
 /// Verify SIP digest auth using a pre-computed HA1 hash
