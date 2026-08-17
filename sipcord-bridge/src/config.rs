@@ -216,6 +216,10 @@ pub struct BridgeConfig {
     pub voice_join_max_retries: u32,
     /// Delay between voice join retries in seconds
     pub voice_join_retry_delay_secs: u64,
+    /// Maximum time allowed for one Discord voice join attempt
+    pub voice_join_timeout_secs: u64,
+    /// Maximum time allowed for Discord voice teardown
+    pub voice_disconnect_timeout_secs: u64,
     /// PJSIP internal log level (0-6, filtered via tracing)
     pub pjsip_log_level: u32,
     /// Maximum reconnection attempts before tearing down the bridge
@@ -241,6 +245,8 @@ impl Default for BridgeConfig {
             health_check_interval_secs: 5,
             voice_join_max_retries: 2,
             voice_join_retry_delay_secs: 5,
+            voice_join_timeout_secs: 15,
+            voice_disconnect_timeout_secs: 5,
             pjsip_log_level: 4,
             reconnect_max_attempts: 5,
             reconnect_base_delay_secs: 5,
@@ -425,6 +431,8 @@ mod tests {
         assert_eq!(c.empty_bridge_grace_period_secs, 30);
         assert_eq!(c.max_channel_buffer_samples, 32000);
         assert_eq!(c.api_timeout_secs, 10);
+        assert_eq!(c.voice_join_timeout_secs, 15);
+        assert_eq!(c.voice_disconnect_timeout_secs, 5);
         assert_eq!(c.pjsip_log_level, 4);
     }
 

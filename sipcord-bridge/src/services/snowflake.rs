@@ -114,6 +114,12 @@ impl<'de> serde::Deserialize<'de> for Snowflake {
                 Ok(Snowflake(v))
             }
 
+            fn visit_i64<E: serde::de::Error>(self, v: i64) -> Result<Snowflake, E> {
+                u64::try_from(v)
+                    .map(Snowflake)
+                    .map_err(|_| E::custom("snowflake cannot be negative"))
+            }
+
             fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<Snowflake, E> {
                 v.parse::<u64>().map(Snowflake).map_err(E::custom)
             }
@@ -177,5 +183,17 @@ mod tests {
     fn serde_from_string() {
         let back: Snowflake = serde_json::from_str("\"80351110224678912\"").unwrap();
         assert_eq!(back.get(), 80_351_110_224_678_912);
+    }
+
+    #[test]
+    fn toml_integer_deserializes() {
+        #[derive(serde::Deserialize)]
+        struct Wrapper {
+            id: Snowflake,
+        }
+
+        let parsed: Wrapper = toml::from_str("id = 123456789012345678").unwrap();
+        assert_eq!(parsed.id, Snowflake::new(123_456_789_012_345_678));
+        assert!(toml::from_str::<Wrapper>("id = -1").is_err());
     }
 }

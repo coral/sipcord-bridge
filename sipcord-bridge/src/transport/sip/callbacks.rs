@@ -55,7 +55,7 @@ use std::os::raw::c_int;
 use std::ptr;
 
 /// Global sender for outbound call events (set during initialization)
-static OUTBOUND_EVENT_TX: std::sync::OnceLock<tokio::sync::mpsc::Sender<super::SipEvent>> =
+static OUTBOUND_EVENT_TX: std::sync::OnceLock<tokio::sync::mpsc::UnboundedSender<super::SipEvent>> =
     std::sync::OnceLock::new();
 
 /// Pre-bound UDPTL sockets from synchronous T.38 re-INVITE handling.
@@ -65,7 +65,7 @@ pub static T38_PRESOCKETS: std::sync::LazyLock<DashMap<i32, std::net::UdpSocket>
     std::sync::LazyLock::new(DashMap::new);
 
 /// Set the outbound event sender (called from main.rs)
-pub fn set_outbound_event_sender(tx: tokio::sync::mpsc::Sender<super::SipEvent>) {
+pub fn set_outbound_event_sender(tx: tokio::sync::mpsc::UnboundedSender<super::SipEvent>) {
     let _ = OUTBOUND_EVENT_TX.set(tx);
 }
 
@@ -544,11 +544,15 @@ pub unsafe extern "C" fn on_call_state_cb(raw_call_id: pjsua_call_id, _e: *mut p
                     tracking_id
                 );
                 // Emit answered event - the SIP event handler in bridge/mod.rs picks this up
-                if let Some(event_tx) = OUTBOUND_EVENT_TX.get() {
-                    let _ = event_tx.try_send(super::SipEvent::OutboundCallAnswered {
-                        tracking_id: tracking_id.clone(),
-                        call_id,
-                    });
+                if let Some(event_tx) = OUTBOUND_EVENT_TX.get()
+                    && event_tx
+                        .send(super::SipEvent::OutboundCallAnswered {
+                            tracking_id: tracking_id.clone(),
+                            call_id,
+                        })
+                        .is_err()
+                {
+                    tracing::error!("Outbound SIP event queue closed while reporting answer");
                 }
             } else if ci.state == pjsip_inv_state_PJSIP_INV_STATE_DISCONNECTED {
                 let tracking_id = super::remove_outbound_tracking(call_id);
@@ -562,12 +566,18 @@ pub unsafe extern "C" fn on_call_state_cb(raw_call_id: pjsua_call_id, _e: *mut p
                         last_status,
                         last_status_text
                     );
-                    if let Some(event_tx) = OUTBOUND_EVENT_TX.get() {
-                        let _ = event_tx.try_send(super::SipEvent::OutboundCallFailed {
-                            tracking_id: tid,
-                            call_id: Some(call_id),
-                            reason: format!("{} {}", last_status, last_status_text),
-                        });
+                    if let Some(event_tx) = OUTBOUND_EVENT_TX.get()
+                        && event_tx
+                            .send(super::SipEvent::OutboundCallFailed {
+                                tracking_id: tid,
+                                call_id: Some(call_id),
+                                reason: format!("{} {}", last_status, last_status_text),
+                            })
+                            .is_err()
+                    {
+                        tracing::error!(
+                            "Outbound SIP event queue closed while reporting failure"
+                        );
                     }
                 }
                 // Fall through to normal disconnect handling below —
@@ -1312,17 +1322,21 @@ pub unsafe extern "C" fn on_call_rx_reinvite_cb(
             T38_PRESOCKETS.insert(raw_call_id, std_socket);
 
             // 9. Emit T38Offered event (with local_port so handler knows which port)
-            if let Some(event_tx) = OUTBOUND_EVENT_TX.get() {
-                let _ = event_tx.try_send(super::SipEvent::T38Offered {
-                    call_id,
-                    remote_ip: t38_params.remote_ip,
-                    remote_port: t38_params.remote_port,
-                    t38_version: t38_params.t38_version,
-                    max_bit_rate: t38_params.max_bit_rate,
-                    rate_management: t38_params.rate_management,
-                    udp_ec: t38_params.udp_ec,
-                    local_port,
-                });
+            if let Some(event_tx) = OUTBOUND_EVENT_TX.get()
+                && event_tx
+                    .send(super::SipEvent::T38Offered {
+                        call_id,
+                        remote_ip: t38_params.remote_ip,
+                        remote_port: t38_params.remote_port,
+                        t38_version: t38_params.t38_version,
+                        max_bit_rate: t38_params.max_bit_rate,
+                        rate_management: t38_params.rate_management,
+                        udp_ec: t38_params.udp_ec,
+                        local_port,
+                    })
+                    .is_err()
+            {
+                tracing::error!("Outbound SIP event queue closed while reporting T.38 offer");
             }
 
             return;

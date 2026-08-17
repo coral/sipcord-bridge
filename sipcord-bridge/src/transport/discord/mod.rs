@@ -626,6 +626,47 @@ impl DiscordVoiceConnection {
         event_tx: Sender<DiscordEvent>,
         health_check_notify: Arc<tokio::sync::Notify>,
     ) -> Result<Self, DiscordError> {
+        let bridge_cfg = crate::config::AppConfig::bridge();
+        let retries = u64::from(bridge_cfg.voice_join_max_retries);
+        let total_timeout_secs = retries
+            .saturating_mul(bridge_cfg.voice_join_timeout_secs)
+            .saturating_add(
+                retries
+                    .saturating_sub(1)
+                    .saturating_mul(bridge_cfg.voice_join_retry_delay_secs),
+            )
+            .saturating_add(5);
+        let total_timeout = std::time::Duration::from_secs(total_timeout_secs);
+        let attempts = bridge_cfg.voice_join_max_retries;
+        let timeout_bridge_id = bridge_id.clone();
+        tokio::time::timeout(
+            total_timeout,
+            Self::connect_inner(
+                bridge_id,
+                shared_client,
+                guild_id,
+                channel_id,
+                event_tx,
+                health_check_notify,
+            ),
+        )
+        .await
+        .map_err(|_| DiscordError::JoinFailed {
+            attempts,
+            last_error: format!(
+                "bridge {timeout_bridge_id} setup timed out after {total_timeout:?}"
+            ),
+        })?
+    }
+
+    async fn connect_inner(
+        bridge_id: String,
+        shared_client: &Arc<SharedDiscordClient>,
+        guild_id: Snowflake,
+        channel_id: Snowflake,
+        event_tx: Sender<DiscordEvent>,
+        health_check_notify: Arc<tokio::sync::Notify>,
+    ) -> Result<Self, DiscordError> {
         info!(
             "Joining voice channel {} in guild {} for bridge {} (using shared client)",
             channel_id, guild_id, bridge_id
@@ -641,6 +682,7 @@ impl DiscordVoiceConnection {
         let bridge_cfg = crate::config::AppConfig::bridge();
         let max_retries = bridge_cfg.voice_join_max_retries;
         let retry_delay_secs = bridge_cfg.voice_join_retry_delay_secs;
+        let join_timeout = std::time::Duration::from_secs(bridge_cfg.voice_join_timeout_secs);
 
         let mut last_error = None;
         for attempt in 1..=max_retries {
@@ -651,8 +693,8 @@ impl DiscordVoiceConnection {
                 );
             }
 
-            match songbird.join(guild, channel).await {
-                Ok(handler_lock) => {
+            match tokio::time::timeout(join_timeout, songbird.join(guild, channel)).await {
+                Ok(Ok(handler_lock)) => {
                     info!(
                         "Joined voice channel {} in guild {} for bridge {}{}",
                         channel_id,
@@ -773,12 +815,27 @@ impl DiscordVoiceConnection {
                         });
                     }
                 }
-                Err(e) => {
+                Ok(Err(e)) => {
                     error!(
                         "Failed to join voice channel (attempt {}/{}): {:?}",
                         attempt, max_retries, e
                     );
-                    last_error = Some(e);
+                    last_error = Some(format!("{e:?}"));
+
+                    if attempt < max_retries {
+                        info!(
+                            "Waiting {} seconds before retry for bridge {}",
+                            retry_delay_secs, bridge_id
+                        );
+                        tokio::time::sleep(std::time::Duration::from_secs(retry_delay_secs)).await;
+                    }
+                }
+                Err(_) => {
+                    error!(
+                        "Timed out joining voice channel after {:?} (attempt {}/{})",
+                        join_timeout, attempt, max_retries
+                    );
+                    last_error = Some(format!("timed out after {join_timeout:?}"));
 
                     if attempt < max_retries {
                         info!(
@@ -794,7 +851,7 @@ impl DiscordVoiceConnection {
         // All retries failed
         Err(DiscordError::JoinFailed {
             attempts: max_retries,
-            last_error: format!("{:?}", last_error),
+            last_error: last_error.unwrap_or_else(|| "no join attempts configured".into()),
         })
     }
 
@@ -864,6 +921,22 @@ impl DiscordVoiceConnection {
     /// This only leaves the voice channel — it does NOT shut down the shared
     /// Discord client, which stays alive for other connections.
     pub async fn disconnect(self) {
+        let bridge_id = self.inner.bridge_id.clone();
+        let timeout = std::time::Duration::from_secs(
+            crate::config::AppConfig::bridge().voice_disconnect_timeout_secs,
+        );
+        if tokio::time::timeout(timeout, self.disconnect_inner())
+            .await
+            .is_err()
+        {
+            warn!(
+                "Timed out disconnecting bridge {} from Discord after {:?}; continuing cleanup",
+                bridge_id, timeout
+            );
+        }
+    }
+
+    async fn disconnect_inner(self) {
         info!("Disconnecting bridge {} from Discord", self.inner.bridge_id);
 
         // Deactivate the VoiceReceiver to prevent stale event processing.

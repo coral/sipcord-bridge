@@ -33,7 +33,7 @@ use crate::transport::sip::{
 };
 use crate::BridgeError;
 use crate::services::sound::SoundError;
-use crossbeam_channel::{Receiver, Sender, bounded};
+use crossbeam_channel::{Receiver, Sender};
 use dashmap::{DashMap, DashSet};
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -46,6 +46,37 @@ use udptl::AsyncUdptlSocket;
 
 /// Type alias for fax session entries stored in the DashMap.
 type FaxSessionEntry = (Arc<tokio::sync::Mutex<FaxSession>>, CancellationToken);
+
+/// Owns the right to create/reconnect a bridge for one channel.
+///
+/// Dropping the lease always clears the pending marker and wakes waiters, including
+/// when an async task is cancelled or panics while Discord is connecting.
+struct PendingBridgeLease {
+    channel_id: Snowflake,
+    pending_bridges: Arc<DashSet<Snowflake>>,
+    bridge_ready_notifiers: Arc<DashMap<Snowflake, Arc<Notify>>>,
+}
+
+impl PendingBridgeLease {
+    fn try_acquire(
+        channel_id: Snowflake,
+        pending_bridges: Arc<DashSet<Snowflake>>,
+        bridge_ready_notifiers: Arc<DashMap<Snowflake, Arc<Notify>>>,
+    ) -> Option<Self> {
+        pending_bridges.insert(channel_id).then_some(Self {
+            channel_id,
+            pending_bridges,
+            bridge_ready_notifiers,
+        })
+    }
+}
+
+impl Drop for PendingBridgeLease {
+    fn drop(&mut self) {
+        self.pending_bridges.remove(&self.channel_id);
+        notify_bridge_ready(&self.bridge_ready_notifiers, self.channel_id);
+    }
+}
 
 fn classify_failure_reason(reason: &str) -> OutboundCallFailureReason {
     let reason = reason.to_ascii_lowercase();
@@ -64,6 +95,18 @@ fn classify_failure_reason(reason: &str) -> OutboundCallFailureReason {
     } else {
         OutboundCallFailureReason::Internal
     }
+}
+
+fn take_outbound_call_legs(
+    tracking_id: &str,
+    sip_calls: &DashMap<CallId, SipCallInfo>,
+) -> HashSet<CallId> {
+    let mut legs: HashSet<CallId> =
+        crate::transport::sip::fork_group::cancel(tracking_id).into_iter().collect();
+    legs.extend(sip_calls.iter().filter_map(|entry| {
+        (entry.value().tracking_id.as_deref() == Some(tracking_id)).then_some(*entry.key())
+    }));
+    legs
 }
 
 #[cfg(test)]
@@ -88,6 +131,130 @@ mod outbound_failure_tests {
             classify_failure_reason("503 Service Unavailable"),
             OutboundCallFailureReason::Transport
         );
+    }
+
+    #[test]
+    fn pending_bridge_lease_is_exclusive_and_reusable() {
+        let pending = Arc::new(DashSet::new());
+        let notifiers = Arc::new(DashMap::new());
+        let channel_id = Snowflake::new(1);
+
+        let lease = PendingBridgeLease::try_acquire(
+            channel_id,
+            pending.clone(),
+            notifiers.clone(),
+        )
+        .unwrap();
+        assert!(
+            PendingBridgeLease::try_acquire(channel_id, pending.clone(), notifiers.clone())
+                .is_none()
+        );
+
+        drop(lease);
+        assert!(!pending.contains(&channel_id));
+        assert!(PendingBridgeLease::try_acquire(channel_id, pending, notifiers).is_some());
+    }
+
+    #[tokio::test]
+    async fn pending_bridge_lease_wakes_waiters_when_dropped() {
+        let pending = Arc::new(DashSet::new());
+        let notifiers = Arc::new(DashMap::new());
+        let channel_id = Snowflake::new(2);
+        let notify = Arc::new(Notify::new());
+        notifiers.insert(channel_id, notify.clone());
+
+        let lease = PendingBridgeLease::try_acquire(channel_id, pending.clone(), notifiers)
+            .unwrap();
+        let waiter = tokio::spawn(async move { notify.notified().await });
+        tokio::task::yield_now().await;
+        drop(lease);
+
+        tokio::time::timeout(Duration::from_millis(100), waiter)
+            .await
+            .expect("waiter was not notified")
+            .expect("waiter task failed");
+        assert!(!pending.contains(&channel_id));
+    }
+
+    #[tokio::test]
+    async fn aborting_bridge_creation_clears_pending_marker() {
+        let pending = Arc::new(DashSet::new());
+        let notifiers = Arc::new(DashMap::new());
+        let channel_id = Snowflake::new(3);
+        let task_pending = pending.clone();
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+
+        let task = tokio::spawn(async move {
+            let _lease = PendingBridgeLease::try_acquire(
+                channel_id,
+                task_pending,
+                notifiers,
+            )
+            .unwrap();
+            let _ = ready_tx.send(());
+            std::future::pending::<()>().await;
+        });
+        ready_rx.await.unwrap();
+        assert!(pending.contains(&channel_id));
+
+        task.abort();
+        let _ = task.await;
+        assert!(!pending.contains(&channel_id));
+    }
+
+    #[test]
+    fn cancellation_collects_ringing_and_connected_legs_once() {
+        let tracking_id = format!(
+            "cancel_all_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let ringing = CallId::new(10_001);
+        let overlapping = CallId::new(10_002);
+        let connected = CallId::new(10_003);
+        assert!(crate::transport::sip::fork_group::add_member(
+            &tracking_id,
+            ringing,
+            2
+        ));
+        assert!(crate::transport::sip::fork_group::add_member(
+            &tracking_id,
+            overlapping,
+            2
+        ));
+
+        let calls = DashMap::new();
+        for call_id in [overlapping, connected] {
+            calls.insert(
+                call_id,
+                SipCallInfo {
+                    channel_id: None,
+                    _user_id: None,
+                    _guild_id: None,
+                    tracking_id: Some(tracking_id.clone()),
+                },
+            );
+        }
+        calls.insert(
+            CallId::new(10_004),
+            SipCallInfo {
+                channel_id: None,
+                _user_id: None,
+                _guild_id: None,
+                tracking_id: Some("different-call".into()),
+            },
+        );
+
+        let legs = take_outbound_call_legs(&tracking_id, &calls);
+        assert_eq!(legs, HashSet::from([ringing, overlapping, connected]));
+        assert!(take_outbound_call_legs(&tracking_id, &calls).contains(&connected));
+        assert!(!crate::transport::sip::fork_group::add_member(
+            &tracking_id,
+            CallId::new(10_005),
+            1
+        ));
     }
 }
 
@@ -195,7 +362,7 @@ impl BridgeCoordinator {
         sip_event_rx: Receiver<SipEvent>,
         shared_discord: Arc<SharedDiscordClient>,
     ) -> Result<Self, SoundError> {
-        let (discord_event_tx, discord_event_rx) = bounded(1000);
+        let (discord_event_tx, discord_event_rx) = crate::transport::sip::control_channel();
 
         // Load sounds from config.toml
         let sounds_dir = PathBuf::from(&crate::config::EnvConfig::global().sounds_dir);
@@ -445,20 +612,28 @@ impl BridgeCoordinator {
                             tracking_id, call_id
                         );
 
-                        // Check fork group: cancel sibling legs
-                        if let Some(siblings) =
+                        // The fork group is authoritative. A missing group means this is a
+                        // late answer after cancellation or after another phone already won.
+                        let Some(siblings) =
                             crate::transport::sip::fork_group::mark_answered(&tracking_id, call_id)
-                        {
-                            for sib_id in siblings {
-                                info!(
-                                    "Cancelling sibling fork leg: call_id={} (tracking_id={})",
-                                    sib_id, tracking_id
-                                );
-                                // Remove from outbound tracking so its disconnect
-                                // callback won't emit OutboundCallFailed
-                                crate::transport::sip::remove_outbound_tracking(sib_id);
-                                let _ = sip_cmd_tx.send(SipCommand::Hangup { call_id: sib_id });
-                            }
+                        else {
+                            warn!(
+                                "Rejecting late fork answer: tracking_id={}, call_id={}",
+                                tracking_id, call_id
+                            );
+                            crate::transport::sip::remove_outbound_tracking(call_id);
+                            let _ = sip_cmd_tx.send(SipCommand::Hangup { call_id });
+                            continue;
+                        };
+                        for sib_id in siblings {
+                            info!(
+                                "Cancelling sibling fork leg: call_id={} (tracking_id={})",
+                                sib_id, tracking_id
+                            );
+                            // Remove from outbound tracking so its disconnect
+                            // callback won't emit OutboundCallFailed
+                            crate::transport::sip::remove_outbound_tracking(sib_id);
+                            let _ = sip_cmd_tx.send(SipCommand::Hangup { call_id: sib_id });
                         }
 
                         backend_for_sip
@@ -581,19 +756,7 @@ impl BridgeCoordinator {
                     OutboundCallCommand::Cancel { call_id } => {
                         outbound_requests_for_handler.remove(&call_id);
 
-                        for leg_id in crate::transport::sip::fork_group::cancel(&call_id) {
-                            crate::transport::sip::remove_outbound_tracking(leg_id);
-                            let _ = outbound_sip_cmd_tx.send(SipCommand::Hangup { call_id: leg_id });
-                        }
-
-                        let connected_legs: Vec<CallId> = outbound_sip_calls
-                            .iter()
-                            .filter_map(|entry| {
-                                (entry.value().tracking_id.as_deref() == Some(call_id.as_str()))
-                                    .then_some(*entry.key())
-                            })
-                            .collect();
-                        for leg_id in connected_legs {
+                        for leg_id in take_outbound_call_legs(&call_id, &outbound_sip_calls) {
                             crate::transport::sip::remove_outbound_tracking(leg_id);
                             let _ = outbound_sip_cmd_tx.send(SipCommand::Hangup { call_id: leg_id });
                         }
@@ -934,7 +1097,13 @@ impl BridgeCoordinator {
                         "Attempting reconnection for unhealthy bridge {} (channel {}, attempt {}/{})",
                         bridge_id, channel_id, attempt_num, bridge_cfg.reconnect_max_attempts
                     );
-                    pending_bridges.insert(channel_id);
+                    let Some(_pending_lease) = PendingBridgeLease::try_acquire(
+                        channel_id,
+                        pending_bridges.clone(),
+                        bridge_ready_notifiers.clone(),
+                    ) else {
+                        continue;
+                    };
 
                     if let Some((_, old_bridge)) = bridges.remove(&channel_id) {
                         let sip_calls = old_bridge.sip_calls.clone();
@@ -1021,8 +1190,6 @@ impl BridgeCoordinator {
                             }
                         }
 
-                        pending_bridges.remove(&channel_id);
-                        notify_bridge_ready(&bridge_ready_notifiers, channel_id);
                     }
                 }
             }
@@ -1333,7 +1500,25 @@ async fn handle_incoming_call(
                     return;
                 }
 
-                pending_bridges.insert(channel_id);
+                let Some(_pending_lease) = PendingBridgeLease::try_acquire(
+                    channel_id,
+                    pending_bridges.clone(),
+                    bridge_ready_notifiers.clone(),
+                ) else {
+                    warn!(
+                        "Bridge creation raced for channel {} (call {}), rejecting duplicate creator",
+                        channel_id, call_id
+                    );
+                    play_error_and_hangup(
+                        call_id,
+                        CallError::ServerBusy,
+                        &sound_manager,
+                        &sip_cmd_tx,
+                    )
+                    .await;
+                    sip_calls.remove(&call_id);
+                    return;
+                };
                 info!(
                     "Creating new bridge for channel {} (call {})",
                     channel_id, call_id
@@ -1354,8 +1539,6 @@ async fn handle_incoming_call(
                         if !sip_calls.contains_key(&call_id) {
                             warn!("Call {} ended while connecting to Discord", call_id);
                             connection.disconnect().await;
-                            pending_bridges.remove(&channel_id);
-                            notify_bridge_ready(&bridge_ready_notifiers, channel_id);
                             return;
                         }
 
@@ -1380,9 +1563,6 @@ async fn handle_incoming_call(
                                 last_reconnect_at: None,
                             },
                         );
-
-                        pending_bridges.remove(&channel_id);
-                        notify_bridge_ready(&bridge_ready_notifiers, channel_id);
 
                         if let Some(mut call) = sip_calls.get_mut(&call_id) {
                             call.channel_id = Some(channel_id);
@@ -1410,8 +1590,6 @@ async fn handle_incoming_call(
                         play_discord_join(call_id, &sound_manager, &sip_cmd_tx).await;
                     }
                     Err(e) => {
-                        pending_bridges.remove(&channel_id);
-                        notify_bridge_ready(&bridge_ready_notifiers, channel_id);
                         error!("Failed to connect to Discord for call {}: {}", call_id, e);
 
                         play_error_and_hangup(
@@ -1556,7 +1734,23 @@ async fn handle_outbound_call_answered(
 
     // Step 6: Create new bridge (no existing bridge in this guild — checked above)
     {
-        pending_bridges.insert(channel_id);
+        let Some(_pending_lease) = PendingBridgeLease::try_acquire(
+            channel_id,
+            pending_bridges.clone(),
+            bridge_ready_notifiers.clone(),
+        ) else {
+            warn!(
+                "Bridge creation raced for channel {} (outbound call {})",
+                channel_id, call_id
+            );
+            backend.report_call_status(
+                &req.call_id,
+                OutboundCallStatus::Failed(OutboundCallFailureReason::Internal),
+            );
+            let _ = sip_cmd_tx.send(SipCommand::Hangup { call_id });
+            sip_calls.remove(&call_id);
+            return;
+        };
         info!(
             "Creating new bridge for channel {} (outbound call {})",
             channel_id, call_id
@@ -1580,8 +1774,6 @@ async fn handle_outbound_call_answered(
                         call_id
                     );
                     connection.disconnect().await;
-                    pending_bridges.remove(&channel_id);
-                    notify_bridge_ready(&bridge_ready_notifiers, channel_id);
                     return;
                 }
 
@@ -1610,9 +1802,6 @@ async fn handle_outbound_call_answered(
                     },
                 );
 
-                pending_bridges.remove(&channel_id);
-                notify_bridge_ready(&bridge_ready_notifiers, channel_id);
-
                 if let Some(mut call) = sip_calls.get_mut(&call_id) {
                     call.channel_id = Some(channel_id);
                     call._guild_id = Some(guild_id);
@@ -1623,8 +1812,6 @@ async fn handle_outbound_call_answered(
                 play_discord_join(call_id, &sound_manager, &sip_cmd_tx).await;
             }
             Err(e) => {
-                pending_bridges.remove(&channel_id);
-                notify_bridge_ready(&bridge_ready_notifiers, channel_id);
                 error!(
                     "Failed to connect to Discord for outbound call {}: {}",
                     call_id, e

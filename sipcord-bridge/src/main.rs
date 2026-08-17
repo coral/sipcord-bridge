@@ -65,7 +65,7 @@ async fn run_static_router() -> Result<(), BridgeError> {
     let sip_event_tx = sip_transport.event_sender();
 
     // Create channel for outbound call events (SIP callbacks still emit these)
-    let (outbound_event_tx, mut outbound_event_rx) = tokio::sync::mpsc::channel(100);
+    let (outbound_event_tx, mut outbound_event_rx) = tokio::sync::mpsc::unbounded_channel();
     sipcord_bridge::transport::sip::set_outbound_event_sender(outbound_event_tx);
 
     // Forward outbound call events to the main SIP event channel

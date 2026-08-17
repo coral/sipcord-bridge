@@ -26,7 +26,7 @@ pub use register_handler::{PendingRegisterTsx, set_register_event_sender, set_si
 use crate::config::{SipConfig, TlsConfig};
 use crate::transport::discord::send_audio_to_discord_direct;
 use crate::transport::sip::error::{SipCallError, SipError, SipInitError};
-use crossbeam_channel::{Receiver, Sender, bounded};
+use crossbeam_channel::{Receiver, Sender, unbounded};
 use dashmap::DashMap;
 use parking_lot::RwLock;
 use std::net::IpAddr;
@@ -149,8 +149,10 @@ pub struct SipTransport {
 
 impl SipTransport {
     pub fn new(config: SipConfig, tls_config: Option<TlsConfig>) -> Self {
-        let (event_tx, event_rx) = bounded(1000);
-        let (command_tx, command_rx) = bounded(1000);
+        // These are low-volume lifecycle/control messages. They must not block an
+        // FFI callback or a Tokio worker if the consumer is temporarily delayed.
+        let (event_tx, event_rx) = control_channel();
+        let (command_tx, command_rx) = control_channel();
         Self {
             config,
             tls_config,
@@ -212,6 +214,10 @@ impl SipTransport {
         }
         Ok(())
     }
+}
+
+pub(crate) fn control_channel<T>() -> (Sender<T>, Receiver<T>) {
+    unbounded()
 }
 
 /// Run the pjsua event loop (blocking)
@@ -610,5 +616,22 @@ fn make_outbound_call(
         }
 
         Ok(CallId::new(call_id))
+    }
+}
+
+#[cfg(test)]
+mod control_channel_tests {
+    use super::control_channel;
+
+    #[test]
+    fn control_channel_absorbs_bursts_without_blocking_producers() {
+        let (tx, rx) = control_channel();
+        for value in 0..25_000 {
+            tx.try_send(value).expect("control channel must not fill");
+        }
+        assert_eq!(rx.len(), 25_000);
+        for expected in 0..25_000 {
+            assert_eq!(rx.try_recv(), Ok(expected));
+        }
     }
 }

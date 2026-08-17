@@ -51,7 +51,7 @@ impl std::fmt::Debug for PendingRegisterTsx {
 // Globals
 
 /// Channel for sending register events to the async verification task.
-static REGISTER_EVENT_TX: std::sync::OnceLock<tokio::sync::mpsc::Sender<RegisterRequest>> =
+static REGISTER_EVENT_TX: std::sync::OnceLock<tokio::sync::mpsc::UnboundedSender<RegisterRequest>> =
     std::sync::OnceLock::new();
 
 /// Sender half of the SIP command channel (for deferred REGISTER responses).
@@ -61,7 +61,7 @@ static SIP_COMMAND_TX: std::sync::OnceLock<crossbeam_channel::Sender<super::SipC
 /// Pointer to the registered pjsip_module, needed for `pjsip_tsx_create_uas2`.
 static REGISTER_MODULE_PTR: AtomicPtr<pjsip_module> = AtomicPtr::new(ptr::null_mut());
 
-pub fn set_register_event_sender(tx: tokio::sync::mpsc::Sender<RegisterRequest>) {
+pub fn set_register_event_sender(tx: tokio::sync::mpsc::UnboundedSender<RegisterRequest>) {
     let _ = REGISTER_EVENT_TX.set(tx);
 }
 
@@ -71,6 +71,39 @@ pub fn set_sip_command_sender(tx: crossbeam_channel::Sender<super::SipCommand>) 
 
 pub fn set_register_module_ptr(ptr: *mut pjsip_module) {
     REGISTER_MODULE_PTR.store(ptr, Ordering::Release);
+}
+
+fn dispatch_register_request(
+    request: RegisterRequest,
+    event_tx: Option<&tokio::sync::mpsc::UnboundedSender<RegisterRequest>>,
+    command_tx: Option<&crossbeam_channel::Sender<super::SipCommand>>,
+) {
+    let result = match event_tx {
+        Some(tx) => tx.send(request).map_err(|error| error.0),
+        None => Err(request),
+    };
+    let Err(mut request) = result else {
+        return;
+    };
+
+    tracing::error!(
+        "REGISTER verification queue is unavailable for user {}",
+        request.digest_auth.username
+    );
+    if let Some(pending) = request.pending_tsx.take() {
+        if let Some(tx) = command_tx {
+            let _ = tx.send(super::SipCommand::RespondRegister {
+                pending,
+                auth_ok: false,
+            });
+        } else {
+            tracing::error!("SIP command queue is unavailable; deferred REGISTER cannot be rejected");
+        }
+    }
+}
+
+fn queue_register_request(request: RegisterRequest) {
+    dispatch_register_request(request, REGISTER_EVENT_TX.get(), SIP_COMMAND_TX.get());
 }
 
 // Helpers
@@ -331,16 +364,14 @@ pub unsafe extern "C" fn on_rx_request_cb(rdata: *mut pjsip_rx_data) -> pj_bool_
                             );
                         }
                         // Send to async handler for registrar update
-                        if let Some(tx) = REGISTER_EVENT_TX.get() {
-                            let _ = tx.try_send(RegisterRequest {
-                                digest_auth: params,
-                                contact_uri: contact_uri.unwrap_or_default(),
-                                source_addr,
-                                transport,
-                                expires,
-                                pending_tsx: None,
-                            });
-                        }
+                        queue_register_request(RegisterRequest {
+                            digest_auth: params,
+                            contact_uri: contact_uri.unwrap_or_default(),
+                            source_addr,
+                            transport,
+                            expires,
+                            pending_tsx: None,
+                        });
                         return pj_constants__PJ_TRUE as pj_bool_t;
                     }
                     VerifyResult::Mismatch => {
@@ -353,16 +384,14 @@ pub unsafe extern "C" fn on_rx_request_cb(rdata: *mut pjsip_rx_data) -> pj_bool_
                         send_simple_response(rdata, 403, c"Forbidden");
                         // Send to async so API can re-verify (cache may be stale
                         // after a password change) and update failure counts
-                        if let Some(tx) = REGISTER_EVENT_TX.get() {
-                            let _ = tx.try_send(RegisterRequest {
-                                digest_auth: params,
-                                contact_uri: contact_uri.unwrap_or_default(),
-                                source_addr,
-                                transport,
-                                expires,
-                                pending_tsx: None,
-                            });
-                        }
+                        queue_register_request(RegisterRequest {
+                            digest_auth: params,
+                            contact_uri: contact_uri.unwrap_or_default(),
+                            source_addr,
+                            transport,
+                            expires,
+                            pending_tsx: None,
+                        });
                         return pj_constants__PJ_TRUE as pj_bool_t;
                     }
                     VerifyResult::Miss => {
@@ -376,16 +405,14 @@ pub unsafe extern "C" fn on_rx_request_cb(rdata: *mut pjsip_rx_data) -> pj_bool_
                         );
                         match create_register_tsx(rdata, expires, contact_uri.clone()) {
                             Ok(pending) => {
-                                if let Some(tx) = REGISTER_EVENT_TX.get() {
-                                    let _ = tx.try_send(RegisterRequest {
-                                        digest_auth: params,
-                                        contact_uri: contact_uri.unwrap_or_default(),
-                                        source_addr,
-                                        transport,
-                                        expires,
-                                        pending_tsx: Some(pending),
-                                    });
-                                }
+                                queue_register_request(RegisterRequest {
+                                    digest_auth: params,
+                                    contact_uri: contact_uri.unwrap_or_default(),
+                                    source_addr,
+                                    transport,
+                                    expires,
+                                    pending_tsx: Some(pending),
+                                });
                                 return pj_constants__PJ_TRUE as pj_bool_t;
                             }
                             Err(e) => {
@@ -410,16 +437,14 @@ pub unsafe extern "C" fn on_rx_request_cb(rdata: *mut pjsip_rx_data) -> pj_bool_
             );
             let contact_uri_for_response = contact_uri.clone();
             let user_for_log = params.username.clone();
-            if let Some(tx) = REGISTER_EVENT_TX.get() {
-                let _ = tx.try_send(RegisterRequest {
-                    digest_auth: params,
-                    contact_uri: contact_uri.unwrap_or_default(),
-                    source_addr,
-                    transport,
-                    expires,
-                    pending_tsx: None,
-                });
-            }
+            queue_register_request(RegisterRequest {
+                digest_auth: params,
+                contact_uri: contact_uri.unwrap_or_default(),
+                source_addr,
+                transport,
+                expires,
+                pending_tsx: None,
+            });
             if let Err(e) = send_register_ok(rdata, expires, contact_uri_for_response.as_deref())
             {
                 tracing::warn!(
@@ -561,4 +586,49 @@ pub struct RegisterRequest {
     /// `SipCommand::RespondRegister` so the pjsip thread can complete
     /// the UAS transaction.
     pub pending_tsx: Option<PendingRegisterTsx>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn request(pending: bool) -> RegisterRequest {
+        RegisterRequest {
+            digest_auth: DigestAuthParams {
+                username: "alice".into(),
+                ..DigestAuthParams::default()
+            },
+            contact_uri: "sip:alice@phone.local".into(),
+            source_addr: None,
+            transport: crate::services::registrar::SipTransport::Udp,
+            expires: 300,
+            pending_tsx: pending.then_some(PendingRegisterTsx {
+                tsx: SendableTsx(ptr::null_mut()),
+                tdata: SendableTdata(ptr::null_mut()),
+                expires: 300,
+                contact_uri: Some("sip:alice@phone.local".into()),
+            }),
+        }
+    }
+
+    #[test]
+    fn live_verification_queue_receives_register() {
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+        dispatch_register_request(request(false), Some(&event_tx), None);
+        assert_eq!(event_rx.try_recv().unwrap().digest_auth.username, "alice");
+    }
+
+    #[test]
+    fn closed_verification_queue_rejects_deferred_register() {
+        let (event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel();
+        drop(event_rx);
+        let (command_tx, command_rx) = crossbeam_channel::unbounded();
+
+        dispatch_register_request(request(true), Some(&event_tx), Some(&command_tx));
+
+        assert!(matches!(
+            command_rx.try_recv(),
+            Ok(super::super::SipCommand::RespondRegister { auth_ok: false, .. })
+        ));
+    }
 }

@@ -28,6 +28,8 @@ test_tone = { extension = 0 }
 # health_check_interval_secs = 5
 # voice_join_max_retries = 2
 # voice_join_retry_delay_secs = 5
+# voice_join_timeout_secs = 15
+# voice_disconnect_timeout_secs = 5
 # pjsip_log_level = 4
 
 [audio]

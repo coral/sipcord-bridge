@@ -85,6 +85,11 @@ pub fn add_initial_failure(tracking_id: &str, fork_total: usize) -> bool {
             answered_call_id: None,
             expected_total: fork_total,
         });
+    if resolved_groups().contains_key(tracking_id) {
+        drop(entry);
+        groups().remove(tracking_id);
+        return false;
+    }
     entry.initial_failures += 1;
     debug!(
         "Fork group {}: initial failure, failures={}/{}",
@@ -206,6 +211,8 @@ pub fn cleanup_resolved(max_age: Duration) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Arc, Barrier};
+    use std::thread;
 
     /// Generate a unique tracking ID per test to avoid interference with the global DashMap
     fn unique_id(base: &str) -> String {
@@ -329,6 +336,7 @@ mod tests {
         let tid = unique_id("cancel_before_member");
         assert!(cancel(&tid).is_empty());
         assert!(!add_member(&tid, CallId::new(710), 1));
+        assert!(mark_answered(&tid, CallId::new(711)).is_none());
     }
 
     #[test]
@@ -349,5 +357,112 @@ mod tests {
         let siblings = mark_answered(&tid, c2).unwrap();
         assert_eq!(siblings.len(), 1);
         assert!(siblings.contains(&c3));
+    }
+
+    #[test]
+    fn simultaneous_answers_have_exactly_one_winner() {
+        const LEGS: usize = 32;
+        let tid = unique_id("answer_race");
+        for raw_id in 0..LEGS {
+            assert!(add_member(&tid, CallId::new(raw_id as i32 + 1_000), LEGS));
+        }
+
+        let barrier = Arc::new(Barrier::new(LEGS));
+        let handles: Vec<_> = (0..LEGS)
+            .map(|raw_id| {
+                let tid = tid.clone();
+                let barrier = barrier.clone();
+                thread::spawn(move || {
+                    barrier.wait();
+                    mark_answered(&tid, CallId::new(raw_id as i32 + 1_000))
+                })
+            })
+            .collect();
+
+        let outcomes: Vec<_> = handles.into_iter().map(|handle| handle.join().unwrap()).collect();
+        let winners: Vec<_> = outcomes.into_iter().flatten().collect();
+        assert_eq!(winners.len(), 1);
+        assert_eq!(winners[0].len(), LEGS - 1);
+    }
+
+    #[test]
+    fn simultaneous_failures_report_completion_once() {
+        const LEGS: usize = 32;
+        let tid = unique_id("failure_race");
+        for raw_id in 0..LEGS {
+            assert!(add_member(&tid, CallId::new(raw_id as i32 + 2_000), LEGS));
+        }
+
+        let barrier = Arc::new(Barrier::new(LEGS));
+        let handles: Vec<_> = (0..LEGS)
+            .map(|raw_id| {
+                let tid = tid.clone();
+                let barrier = barrier.clone();
+                thread::spawn(move || {
+                    barrier.wait();
+                    mark_failed(&tid, CallId::new(raw_id as i32 + 2_000))
+                })
+            })
+            .collect();
+
+        assert_eq!(
+            handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .filter(|resolved| *resolved)
+                .count(),
+            1
+        );
+        assert!(cancel(&tid).is_empty());
+    }
+
+    #[test]
+    fn cancellation_racing_member_creation_never_leaks_a_leg() {
+        for iteration in 0..100 {
+            let tid = unique_id("cancel_add_race");
+            let call_id = CallId::new(3_000 + iteration);
+            let barrier = Arc::new(Barrier::new(2));
+            let add_tid = tid.clone();
+            let add_barrier = barrier.clone();
+            let add = thread::spawn(move || {
+                add_barrier.wait();
+                add_member(&add_tid, call_id, 1)
+            });
+            let cancel_tid = tid.clone();
+            let cancel = thread::spawn(move || {
+                barrier.wait();
+                cancel(&cancel_tid)
+            });
+
+            let was_added = add.join().unwrap();
+            let cancelled = cancel.join().unwrap();
+            assert!(!was_added || cancelled.contains(&call_id));
+            assert!(!add_member(&tid, CallId::new(4_000 + iteration), 1));
+        }
+    }
+
+    #[test]
+    fn cancellation_rejects_late_initial_failures() {
+        let tid = unique_id("cancel_initial_failure");
+        cancel(&tid);
+        assert!(!add_initial_failure(&tid, 1));
+        assert!(groups().get(&tid).is_none());
+    }
+
+    #[test]
+    fn tombstones_can_be_swept_after_the_late_event_window() {
+        let tid = unique_id("cleanup");
+        cancel(&tid);
+        assert!(!add_member(&tid, CallId::new(5_000), 1));
+
+        resolved_groups().insert(
+            tid.clone(),
+            Instant::now()
+                .checked_sub(Duration::from_secs(10))
+                .expect("test instant underflow"),
+        );
+        cleanup_resolved(Duration::from_secs(1));
+        assert!(add_member(&tid, CallId::new(5_001), 1));
+        cancel(&tid);
     }
 }

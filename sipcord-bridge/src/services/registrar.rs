@@ -80,6 +80,7 @@ impl Registrar {
             existing.registered_at = reg.registered_at;
             existing.contact_uri = reg.contact_uri.clone();
             existing.discord_user_id = reg.discord_user_id.clone();
+            existing.transport = reg.transport;
             let user_changed = old_user_id != existing.discord_user_id;
 
             drop(regs);
@@ -196,6 +197,7 @@ pub fn spawn_cleanup_task(registrar: Arc<Registrar>) {
 mod tests {
     use super::*;
     use std::net::SocketAddr;
+    use std::thread;
 
     fn make_reg(
         sip_user: &str,
@@ -357,5 +359,114 @@ mod tests {
         let contacts = reg.get_contacts_for_discord_user_id("1001");
         assert_eq!(contacts.len(), 1);
         assert_eq!(contacts[0].1, "5.6.7.8:5060".parse().unwrap());
+    }
+
+    #[test]
+    fn many_phones_registered_concurrently_are_all_routable() {
+        const PHONES: usize = 128;
+        let registrar = Arc::new(Registrar::new());
+        let handles: Vec<_> = (0..PHONES)
+            .map(|index| {
+                let registrar = registrar.clone();
+                thread::spawn(move || {
+                    registrar.add_registration(make_reg(
+                        "alice",
+                        "1001",
+                        &format!("10.0.0.{}:{}", index / 250 + 1, 5_000 + index),
+                        &format!("sip:alice@phone-{index}.local"),
+                        300,
+                    ));
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        let contacts = registrar.get_contacts_for_discord_user_id("1001");
+        assert_eq!(contacts.len(), PHONES);
+        for index in 0..PHONES {
+            assert!(
+                contacts
+                    .iter()
+                    .any(|contact| contact.0 == format!("sip:alice@phone-{index}.local"))
+            );
+        }
+    }
+
+    #[test]
+    fn concurrent_refreshes_of_one_phone_do_not_duplicate_it() {
+        let registrar = Arc::new(Registrar::new());
+        let handles: Vec<_> = (0..64)
+            .map(|_| {
+                let registrar = registrar.clone();
+                thread::spawn(move || {
+                    registrar.add_registration(make_reg(
+                        "alice",
+                        "1001",
+                        "10.0.0.1:5060",
+                        "sip:alice@phone.local",
+                        300,
+                    ));
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        assert_eq!(registrar.get_contacts_for_discord_user_id("1001").len(), 1);
+    }
+
+    #[test]
+    fn users_sharing_a_sip_name_never_receive_each_others_contacts() {
+        let registrar = Registrar::new();
+        registrar.add_registration(make_reg(
+            "shared",
+            "1001",
+            "10.0.0.1:5060",
+            "sip:shared@phone-a.local",
+            300,
+        ));
+        registrar.add_registration(make_reg(
+            "shared",
+            "1002",
+            "10.0.0.2:5060",
+            "sip:shared@phone-b.local",
+            300,
+        ));
+
+        let alice = registrar.get_contacts_for_discord_user_id("1001");
+        let bob = registrar.get_contacts_for_discord_user_id("1002");
+        assert_eq!(alice.len(), 1);
+        assert_eq!(alice[0].0, "sip:shared@phone-a.local");
+        assert_eq!(bob.len(), 1);
+        assert_eq!(bob[0].0, "sip:shared@phone-b.local");
+    }
+
+    #[test]
+    fn refresh_updates_transport_and_user_mapping_atomically() {
+        let registrar = Registrar::new();
+        registrar.add_registration(make_reg(
+            "alice",
+            "old-user",
+            "10.0.0.1:5060",
+            "sip:alice@phone.local",
+            300,
+        ));
+        let mut refreshed = make_reg(
+            "alice",
+            "new-user",
+            "10.0.0.1:5060",
+            "sip:alice@phone.local",
+            300,
+        );
+        refreshed.transport = SipTransport::Tls;
+        registrar.add_registration(refreshed);
+
+        assert!(registrar.get_contacts_for_discord_user_id("old-user").is_empty());
+        let contacts = registrar.get_contacts_for_discord_user_id("new-user");
+        assert_eq!(contacts.len(), 1);
+        assert_eq!(contacts[0].2, SipTransport::Tls);
     }
 }
