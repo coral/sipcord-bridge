@@ -21,6 +21,8 @@ pub use channel_audio::{
     cleanup_channel_port, clear_channel_stale_audio, register_call_channel,
     register_discord_to_sip, unregister_call_channel, unregister_discord_to_sip,
 };
+#[cfg(test)]
+pub(crate) use channel_audio::get_samples_from_buffer;
 pub use register_handler::{PendingRegisterTsx, set_register_event_sender, set_sip_command_sender};
 
 use crate::config::{SipConfig, TlsConfig};

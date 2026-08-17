@@ -6,11 +6,11 @@
 //!
 //! New Call Flow (with 183 Session Progress):
 //! 1. SIP call comes in with Digest auth → SipEvent::IncomingCall
-//! 2. Send 183 Session Progress (establishes early media)
-//! 3. Start playing "connecting" sound in loop
-//! 4. Bridge routes call via Backend → gets channel_id and bot_token
-//! 5. Connect to Discord
-//! 6. Stop connecting loop, play discord_join sound, send 200 OK
+//! 2. Route through Backend with a bounded deadline (fax must be known before audio setup)
+//! 3. For voice calls, send 183 and start the connecting loop
+//! 4. Connect to Discord
+//! 5. Publish the bridge, ring buffers, and call/channel registration
+//! 6. Send 200 OK, then queue discord_join audio (which stops the connecting loop)
 //! 7. When caller hangs up, remove from bridge
 //! 8. When last caller leaves, destroy the bridge (disconnect bot)
 
@@ -38,6 +38,7 @@ use dashmap::{DashMap, DashSet};
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
@@ -46,6 +47,62 @@ use udptl::AsyncUdptlSocket;
 
 /// Type alias for fax session entries stored in the DashMap.
 type FaxSessionEntry = (Arc<tokio::sync::Mutex<FaxSession>>, CancellationToken);
+
+type CallInstanceId = u64;
+static NEXT_CALL_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
+
+fn next_call_instance_id() -> CallInstanceId {
+    NEXT_CALL_INSTANCE_ID.fetch_add(1, Ordering::Relaxed)
+}
+
+fn call_is_current(
+    sip_calls: &DashMap<CallId, SipCallInfo>,
+    call_id: CallId,
+    instance_id: CallInstanceId,
+) -> bool {
+    sip_calls
+        .get(&call_id)
+        .is_some_and(|call| call.instance_id == instance_id)
+}
+
+fn remove_call_if_current(
+    sip_calls: &DashMap<CallId, SipCallInfo>,
+    call_id: CallId,
+    instance_id: CallInstanceId,
+) -> Option<SipCallInfo> {
+    use dashmap::mapref::entry::Entry;
+
+    match sip_calls.entry(call_id) {
+        Entry::Occupied(entry) if entry.get().instance_id == instance_id => Some(entry.remove()),
+        _ => None,
+    }
+}
+
+async fn wait_for_pending_bridge(
+    channel_id: Snowflake,
+    call_id: CallId,
+    instance_id: CallInstanceId,
+    bridges: Arc<DashMap<Snowflake, ChannelBridge>>,
+    pending_bridges: Arc<DashSet<Snowflake>>,
+    sip_calls: Arc<DashMap<CallId, SipCallInfo>>,
+    notify: Arc<Notify>,
+) -> bool {
+    loop {
+        // notify_waiters() does not retain a permit. Register this waiter before
+        // checking shared state so completion cannot be lost in check-then-wait.
+        let notified = notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+
+        if bridges.contains_key(&channel_id) || !pending_bridges.contains(&channel_id) {
+            return true;
+        }
+        if !call_is_current(&sip_calls, call_id, instance_id) {
+            return false;
+        }
+        notified.await;
+    }
+}
 
 /// Owns the right to create/reconnect a bridge for one channel.
 ///
@@ -109,9 +166,89 @@ fn take_outbound_call_legs(
     legs
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RouteCallTimeout;
+
+async fn route_call_with_timeout(
+    backend: &dyn Backend,
+    digest_auth: &crate::transport::sip::DigestAuthParams,
+    extension: &str,
+    timeout: Duration,
+) -> Result<RouteDecision, RouteCallTimeout> {
+    tokio::time::timeout(timeout, backend.route_call(digest_auth, extension))
+        .await
+        .map_err(|_| RouteCallTimeout)
+}
+
+async fn start_connecting_early_media(
+    call_id: CallId,
+    sound_manager: &SoundManager,
+    sip_cmd_tx: &Sender<SipCommand>,
+    sip_calls: &DashMap<CallId, SipCallInfo>,
+    instance_id: CallInstanceId,
+) -> bool {
+    if !call_is_current(sip_calls, call_id, instance_id) {
+        return false;
+    }
+    let _ = sip_cmd_tx.send(SipCommand::Send183 { call_id });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    if !call_is_current(sip_calls, call_id, instance_id) {
+        return false;
+    }
+    if let Some(connecting_samples) = sound_manager.get_connecting_samples() {
+        let _ = sip_cmd_tx.send(SipCommand::StartConnectingLoop {
+            call_id,
+            samples: (*connecting_samples).clone(),
+        });
+    } else {
+        warn!("No connecting sound configured - caller will hear silence during setup");
+    }
+    true
+}
+
 #[cfg(test)]
 mod outbound_failure_tests {
     use super::*;
+    use crate::transport::sip::SAMPLES_PER_FRAME;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT_RING_CHANNEL_ID: AtomicU64 = AtomicU64::new(9_000_000);
+
+    fn unique_ring_channel_id() -> Snowflake {
+        Snowflake::new(NEXT_RING_CHANNEL_ID.fetch_add(1, Ordering::Relaxed))
+    }
+
+    struct TestBackend {
+        block_route: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl Backend for TestBackend {
+        fn bot_token(&self) -> &str {
+            "test"
+        }
+
+        async fn route_call(
+            &self,
+            _digest_auth: &crate::transport::sip::DigestAuthParams,
+            _extension: &str,
+        ) -> RouteDecision {
+            if self.block_route {
+                std::future::pending().await
+            } else {
+                RouteDecision::RejectInvalidCredentials
+            }
+        }
+
+        async fn on_call_started(&self, _info: &CallStartedInfo) {}
+        async fn on_call_ended(&self, _sip_call_id: &str) {}
+        async fn heartbeat(&self, _active_channel_ids: &[String]) {}
+        fn report_call_status(&self, _call_id: &str, _status: OutboundCallStatus) {}
+        async fn next_outbound_command(&self) -> Option<OutboundCallCommand> {
+            std::future::pending().await
+        }
+    }
 
     #[test]
     fn classifies_common_sip_failures() {
@@ -131,6 +268,274 @@ mod outbound_failure_tests {
             classify_failure_reason("503 Service Unavailable"),
             OutboundCallFailureReason::Transport
         );
+    }
+
+    #[tokio::test]
+    async fn route_call_is_bounded_when_backend_never_returns() {
+        let backend = TestBackend { block_route: true };
+        let started = Instant::now();
+        let result = route_call_with_timeout(
+            &backend,
+            &crate::transport::sip::DigestAuthParams::default(),
+            "1000",
+            Duration::from_millis(20),
+        )
+        .await;
+
+        assert_eq!(result.err(), Some(RouteCallTimeout));
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[tokio::test]
+    async fn route_call_returns_decision_before_deadline() {
+        let backend = TestBackend { block_route: false };
+        let result = route_call_with_timeout(
+            &backend,
+            &crate::transport::sip::DigestAuthParams::default(),
+            "1000",
+            Duration::from_secs(1),
+        )
+        .await;
+
+        assert!(matches!(
+            result,
+            Ok(RouteDecision::RejectInvalidCredentials)
+        ));
+    }
+
+    #[test]
+    fn connected_call_is_answered_before_join_audio_is_queued() {
+        let call_id = CallId::new(30_001);
+        let (tx, rx) = crossbeam_channel::unbounded();
+
+        queue_connected_call_audio(call_id, Some(vec![1, 2, 3]), &tx);
+
+        assert!(matches!(
+            rx.recv().unwrap(),
+            SipCommand::Answer { call_id: actual } if actual == call_id
+        ));
+        assert!(matches!(
+            rx.recv().unwrap(),
+            SipCommand::PlayDirectToCall { call_id: actual, samples }
+                if actual == call_id && samples == vec![1, 2, 3]
+        ));
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn connected_call_without_join_sound_still_answers_exactly_once() {
+        let call_id = CallId::new(30_002);
+        let (tx, rx) = crossbeam_channel::unbounded();
+
+        queue_connected_call_audio(call_id, None, &tx);
+
+        assert!(matches!(rx.recv().unwrap(), SipCommand::Answer { .. }));
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn stale_async_task_cannot_remove_reused_pjsua_call_id() {
+        let calls = DashMap::new();
+        let call_id = CallId::new(30_003);
+        let old_instance = next_call_instance_id();
+        let new_instance = next_call_instance_id();
+        calls.insert(
+            call_id,
+            SipCallInfo {
+                instance_id: new_instance,
+                channel_id: None,
+                _user_id: None,
+                _guild_id: None,
+                tracking_id: None,
+            },
+        );
+
+        assert!(!call_is_current(&calls, call_id, old_instance));
+        assert!(remove_call_if_current(&calls, call_id, old_instance).is_none());
+        assert!(call_is_current(&calls, call_id, new_instance));
+        assert!(remove_call_if_current(&calls, call_id, new_instance).is_some());
+        assert!(!calls.contains_key(&call_id));
+    }
+
+    #[test]
+    fn many_stale_completions_cannot_delete_reused_call_concurrently() {
+        let calls = Arc::new(DashMap::new());
+        let call_id = CallId::new(30_004);
+        let stale_instance = next_call_instance_id();
+        let current_instance = next_call_instance_id();
+        calls.insert(
+            call_id,
+            SipCallInfo {
+                instance_id: current_instance,
+                channel_id: None,
+                _user_id: None,
+                _guild_id: None,
+                tracking_id: None,
+            },
+        );
+
+        let workers: Vec<_> = (0..16)
+            .map(|_| {
+                let calls = calls.clone();
+                std::thread::spawn(move || {
+                    for _ in 0..1_000 {
+                        assert!(
+                            remove_call_if_current(&calls, call_id, stale_instance).is_none()
+                        );
+                    }
+                })
+            })
+            .collect();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+
+        assert!(call_is_current(&calls, call_id, current_instance));
+        assert!(remove_call_if_current(&calls, call_id, current_instance).is_some());
+    }
+
+    #[test]
+    fn discord_to_sip_ring_buffer_wraparound_preserves_sample_order() {
+        let channel_id = unique_ring_channel_id();
+        setup_channel_ring_buffers(channel_id);
+
+        let first: Vec<i16> = (0..3_000).map(|sample| sample as i16).collect();
+        assert!(crate::transport::discord::write_discord_to_sip(
+            channel_id, &first
+        ));
+        assert!(!crate::transport::discord::write_discord_to_sip(
+            channel_id,
+            &[7; SAMPLES_PER_FRAME]
+        ));
+
+        let mut actual = Vec::new();
+        let mut frame = [0_i16; SAMPLES_PER_FRAME];
+        for _ in 0..9 {
+            let count = crate::transport::sip::get_samples_from_buffer(channel_id, &mut frame);
+            assert_eq!(count, SAMPLES_PER_FRAME);
+            actual.extend_from_slice(&frame[..count]);
+        }
+        assert_eq!(actual, first[..actual.len()]);
+
+        let second: Vec<i16> = (10_000..12_880).map(|sample| sample as i16).collect();
+        assert!(crate::transport::discord::write_discord_to_sip(
+            channel_id, &second
+        ));
+
+        let mut expected = first[actual.len()..].to_vec();
+        expected.extend_from_slice(&second);
+        let mut wrapped = Vec::new();
+        loop {
+            frame.fill(-1);
+            let count = crate::transport::sip::get_samples_from_buffer(channel_id, &mut frame);
+            if count == 0 {
+                break;
+            }
+            wrapped.extend_from_slice(&frame[..count]);
+        }
+        assert_eq!(wrapped, expected);
+
+        teardown_channel_ring_buffers(channel_id);
+    }
+
+    #[test]
+    fn ring_buffer_teardown_blocks_stale_audio_in_both_directions() {
+        let channel_id = unique_ring_channel_id();
+        setup_channel_ring_buffers(channel_id);
+        assert!(crate::transport::discord::write_discord_to_sip(
+            channel_id,
+            &[42; SAMPLES_PER_FRAME]
+        ));
+
+        teardown_channel_ring_buffers(channel_id);
+
+        assert!(!crate::transport::discord::write_discord_to_sip(
+            channel_id,
+            &[99; SAMPLES_PER_FRAME]
+        ));
+        let mut frame = [-1_i16; SAMPLES_PER_FRAME];
+        assert_eq!(
+            crate::transport::sip::get_samples_from_buffer(channel_id, &mut frame),
+            0
+        );
+        assert_eq!(frame, [0; SAMPLES_PER_FRAME]);
+
+        // Teardown is intentionally idempotent for overlapping failure paths.
+        teardown_channel_ring_buffers(channel_id);
+    }
+
+    #[test]
+    fn ring_buffers_keep_simultaneous_channels_isolated() {
+        let first_channel = unique_ring_channel_id();
+        let second_channel = unique_ring_channel_id();
+        setup_channel_ring_buffers(first_channel);
+        setup_channel_ring_buffers(second_channel);
+
+        assert!(crate::transport::discord::write_discord_to_sip(
+            first_channel,
+            &[11; SAMPLES_PER_FRAME]
+        ));
+        assert!(crate::transport::discord::write_discord_to_sip(
+            second_channel,
+            &[22; SAMPLES_PER_FRAME]
+        ));
+
+        let mut frame = [0_i16; SAMPLES_PER_FRAME];
+        assert_eq!(
+            crate::transport::sip::get_samples_from_buffer(second_channel, &mut frame),
+            SAMPLES_PER_FRAME
+        );
+        assert_eq!(frame, [22; SAMPLES_PER_FRAME]);
+        assert_eq!(
+            crate::transport::sip::get_samples_from_buffer(first_channel, &mut frame),
+            SAMPLES_PER_FRAME
+        );
+        assert_eq!(frame, [11; SAMPLES_PER_FRAME]);
+
+        teardown_channel_ring_buffers(first_channel);
+        teardown_channel_ring_buffers(second_channel);
+    }
+
+    #[test]
+    fn ring_buffer_writer_and_reader_make_progress_under_thread_contention() {
+        const FRAME_COUNT: i16 = 500;
+        let channel_id = unique_ring_channel_id();
+        setup_channel_ring_buffers(channel_id);
+
+        let writer = std::thread::spawn(move || {
+            for value in 0..FRAME_COUNT {
+                let frame = [value; SAMPLES_PER_FRAME];
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while !crate::transport::discord::write_discord_to_sip(channel_id, &frame) {
+                    assert!(
+                        Instant::now() < deadline,
+                        "writer stopped making progress at frame {value}"
+                    );
+                    std::thread::yield_now();
+                }
+            }
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut expected = 0_i16;
+        let mut frame = [0_i16; SAMPLES_PER_FRAME];
+        while expected < FRAME_COUNT {
+            let count = crate::transport::sip::get_samples_from_buffer(channel_id, &mut frame);
+            if count == 0 {
+                assert!(
+                    Instant::now() < deadline,
+                    "reader stopped making progress at frame {expected}"
+                );
+                std::thread::yield_now();
+                continue;
+            }
+            assert_eq!(count, SAMPLES_PER_FRAME);
+            assert!(frame.iter().all(|sample| *sample == expected));
+            expected += 1;
+        }
+
+        writer.join().unwrap();
+        teardown_channel_ring_buffers(channel_id);
     }
 
     #[test]
@@ -174,6 +579,108 @@ mod outbound_failure_tests {
             .expect("waiter was not notified")
             .expect("waiter task failed");
         assert!(!pending.contains(&channel_id));
+    }
+
+    #[tokio::test]
+    async fn pending_bridge_completion_cannot_be_lost_between_check_and_wait() {
+        let bridges = Arc::new(DashMap::new());
+        let pending = Arc::new(DashSet::new());
+        let calls = Arc::new(DashMap::new());
+
+        for iteration in 0..500_u64 {
+            let channel_id = Snowflake::new(50_000 + iteration);
+            let call_id = CallId::new(50_000 + iteration as i32);
+            let instance_id = next_call_instance_id();
+            let notify = Arc::new(Notify::new());
+            pending.insert(channel_id);
+            calls.insert(
+                call_id,
+                SipCallInfo {
+                    instance_id,
+                    channel_id: None,
+                    _user_id: None,
+                    _guild_id: None,
+                    tracking_id: None,
+                },
+            );
+
+            let waiter = tokio::spawn(wait_for_pending_bridge(
+                channel_id,
+                call_id,
+                instance_id,
+                bridges.clone(),
+                pending.clone(),
+                calls.clone(),
+                notify.clone(),
+            ));
+
+            if iteration.is_multiple_of(2) {
+                tokio::task::yield_now().await;
+            }
+            pending.remove(&channel_id);
+            notify.notify_waiters();
+
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), waiter)
+                    .await
+                    .expect("bridge waiter lost its wakeup")
+                    .expect("bridge waiter task panicked")
+            );
+            calls.remove(&call_id);
+        }
+    }
+
+    #[tokio::test]
+    async fn pending_bridge_wait_aborts_when_call_instance_is_replaced() {
+        let bridges = Arc::new(DashMap::new());
+        let pending = Arc::new(DashSet::new());
+        let calls = Arc::new(DashMap::new());
+        let notify = Arc::new(Notify::new());
+        let channel_id = Snowflake::new(50_501);
+        let call_id = CallId::new(50_501);
+        let old_instance = next_call_instance_id();
+        pending.insert(channel_id);
+        calls.insert(
+            call_id,
+            SipCallInfo {
+                instance_id: old_instance,
+                channel_id: None,
+                _user_id: None,
+                _guild_id: None,
+                tracking_id: None,
+            },
+        );
+
+        let waiter = tokio::spawn(wait_for_pending_bridge(
+            channel_id,
+            call_id,
+            old_instance,
+            bridges,
+            pending.clone(),
+            calls.clone(),
+            notify.clone(),
+        ));
+        tokio::task::yield_now().await;
+        calls.insert(
+            call_id,
+            SipCallInfo {
+                instance_id: next_call_instance_id(),
+                channel_id: None,
+                _user_id: None,
+                _guild_id: None,
+                tracking_id: None,
+            },
+        );
+        notify.notify_waiters();
+
+        assert!(
+            !tokio::time::timeout(Duration::from_millis(100), waiter)
+                .await
+                .expect("cancelled bridge waiter did not wake")
+                .expect("bridge waiter task panicked")
+        );
+        pending.remove(&channel_id);
+        calls.remove(&call_id);
     }
 
     #[tokio::test]
@@ -230,6 +737,7 @@ mod outbound_failure_tests {
             calls.insert(
                 call_id,
                 SipCallInfo {
+                    instance_id: next_call_instance_id(),
                     channel_id: None,
                     _user_id: None,
                     _guild_id: None,
@@ -240,6 +748,7 @@ mod outbound_failure_tests {
         calls.insert(
             CallId::new(10_004),
             SipCallInfo {
+                instance_id: next_call_instance_id(),
                 channel_id: None,
                 _user_id: None,
                 _guild_id: None,
@@ -304,6 +813,9 @@ pub struct ChannelBridge {
 
 /// Info about an active SIP call
 pub struct SipCallInfo {
+    /// Monotonic coordinator generation. PJSUA reuses numeric call IDs, so
+    /// asynchronous work must match both values before mutating call state.
+    pub instance_id: CallInstanceId,
     /// Which Discord channel this call is connected to (None if still authenticating)
     pub channel_id: Option<Snowflake>,
     /// User ID from API authentication (for call tracking)
@@ -436,6 +948,18 @@ impl BridgeCoordinator {
                             call_id, digest_auth.username, extension, source_ip
                         );
 
+                        let instance_id = next_call_instance_id();
+                        sip_calls.insert(
+                            call_id,
+                            SipCallInfo {
+                                instance_id,
+                                channel_id: None,
+                                _user_id: None,
+                                _guild_id: None,
+                                tracking_id: None,
+                            },
+                        );
+
                         // Check for config-based extension sounds (easter eggs)
                         if let Ok(ext_num) = extension.parse::<u32>()
                             && let Some(sound_name) = sound_manager.get_extension_sound(ext_num)
@@ -447,6 +971,7 @@ impl BridgeCoordinator {
 
                             let sound_manager = sound_manager.clone();
                             let sip_cmd_tx = sip_cmd_tx.clone();
+                            let sip_calls = sip_calls.clone();
                             let sound_name = sound_name.to_string();
 
                             tokio::spawn(async move {
@@ -455,29 +980,27 @@ impl BridgeCoordinator {
                                     &sound_name,
                                     &sound_manager,
                                     &sip_cmd_tx,
+                                    &sip_calls,
+                                    instance_id,
                                 )
                                 .await;
                             });
                             continue;
                         }
 
-                        // Track this call
-                        sip_calls.insert(
-                            call_id,
-                            SipCallInfo {
-                                channel_id: None,
-                                _user_id: None,
-                                _guild_id: None,
-                                tracking_id: None,
-                            },
-                        );
-
                         // Verify auth with API and get channel info
                         let ctx = ctx.clone();
 
                         tokio::spawn(async move {
-                            handle_incoming_call(ctx, call_id, *digest_auth, extension, source_ip)
-                                .await;
+                            handle_incoming_call(
+                                ctx,
+                                call_id,
+                                instance_id,
+                                *digest_auth,
+                                extension,
+                                source_ip,
+                            )
+                            .await;
                         });
                     }
 
@@ -1210,6 +1733,7 @@ impl BridgeCoordinator {
 async fn handle_incoming_call(
     ctx: BridgeContext,
     call_id: CallId,
+    instance_id: CallInstanceId,
     digest_auth: crate::transport::sip::DigestAuthParams,
     extension: String,
     source_ip: Option<std::net::IpAddr>,
@@ -1227,23 +1751,72 @@ async fn handle_incoming_call(
         shared_discord,
         health_check_notify,
     } = ctx;
-    // Route the call via the backend FIRST to determine call type
-    let decision = backend.route_call(&digest_auth, &extension).await;
+    // Route the call via the backend FIRST to determine call type. The outer
+    // timeout protects standalone/custom Backend implementations too; relying
+    // on an HTTP client's timeout here leaves the whole call task unbounded.
+    let route_timeout = Duration::from_secs(crate::config::AppConfig::bridge().api_timeout_secs);
+    let decision = match route_call_with_timeout(
+        backend.as_ref(),
+        &digest_auth,
+        &extension,
+        route_timeout,
+    )
+    .await
+    {
+        Ok(decision) => decision,
+        Err(RouteCallTimeout) => {
+            if !call_is_current(&sip_calls, call_id, instance_id) {
+                return;
+            }
+            error!(
+                "Routing timed out after {:?} for call {} (extension {})",
+                route_timeout, call_id, extension
+            );
+            if !start_connecting_early_media(
+                call_id,
+                &sound_manager,
+                &sip_cmd_tx,
+                &sip_calls,
+                instance_id,
+            )
+            .await
+            {
+                return;
+            }
+            play_error_and_hangup(
+                call_id,
+                instance_id,
+                CallError::Unknown,
+                &sound_manager,
+                &sip_cmd_tx,
+                &sip_calls,
+            )
+            .await;
+            remove_call_if_current(&sip_calls, call_id, instance_id);
+            return;
+        }
+    };
+
+    // The caller can hang up while the backend is routing. Never apply a late
+    // decision to a dead (or subsequently reused) PJSUA call ID.
+    if !call_is_current(&sip_calls, call_id, instance_id) {
+        warn!("Call {} ended while backend routing was in progress", call_id);
+        return;
+    }
 
     // For non-fax calls: send 183 Session Progress and play connecting sound
     let is_fax = matches!(decision, RouteDecision::ConnectFax { .. });
-    if !is_fax {
-        let _ = sip_cmd_tx.send(SipCommand::Send183 { call_id });
-        tokio::time::sleep(Duration::from_millis(100)).await;
-
-        if let Some(connecting_samples) = sound_manager.get_connecting_samples() {
-            let _ = sip_cmd_tx.send(SipCommand::StartConnectingLoop {
-                call_id,
-                samples: (*connecting_samples).clone(),
-            });
-        } else {
-            warn!("No connecting sound configured - caller will hear silence during setup");
-        }
+    if !is_fax
+        && !start_connecting_early_media(
+            call_id,
+            &sound_manager,
+            &sip_cmd_tx,
+            &sip_calls,
+            instance_id,
+        )
+        .await
+    {
+        return;
     }
 
     match decision {
@@ -1254,7 +1827,7 @@ async fn handle_incoming_call(
                 domain,
                 extension,
             });
-            sip_calls.remove(&call_id);
+            remove_call_if_current(&sip_calls, call_id, instance_id);
         }
 
         RouteDecision::RejectInvalidCredentials => {
@@ -1263,13 +1836,21 @@ async fn handle_incoming_call(
                 call_id, source_ip
             );
             let _ = sip_cmd_tx.send(SipCommand::Hangup { call_id });
-            sip_calls.remove(&call_id);
+            remove_call_if_current(&sip_calls, call_id, instance_id);
         }
 
         RouteDecision::RejectWithError { error } => {
             error!("Call {} rejected: {:?}", call_id, error);
-            play_error_and_hangup(call_id, error, &sound_manager, &sip_cmd_tx).await;
-            sip_calls.remove(&call_id);
+            play_error_and_hangup(
+                call_id,
+                instance_id,
+                error,
+                &sound_manager,
+                &sip_cmd_tx,
+                &sip_calls,
+            )
+            .await;
+            remove_call_if_current(&sip_calls, call_id, instance_id);
         }
 
         RouteDecision::ConnectFax {
@@ -1297,7 +1878,7 @@ async fn handle_incoming_call(
                 Err(e) => {
                     error!("Failed to create fax session for call {}: {}", call_id, e);
                     let _ = sip_cmd_tx.send(SipCommand::Hangup { call_id });
-                    sip_calls.remove(&call_id);
+                    remove_call_if_current(&sip_calls, call_id, instance_id);
                     return;
                 }
             };
@@ -1308,8 +1889,14 @@ async fn handle_incoming_call(
             // Post "Receiving fax..." message to Discord
             if let Err(e) = fax_session.post_receiving_message().await {
                 error!("Failed to post fax receiving message: {}", e);
-                let _ = sip_cmd_tx.send(SipCommand::Hangup { call_id });
-                sip_calls.remove(&call_id);
+                if call_is_current(&sip_calls, call_id, instance_id) {
+                    let _ = sip_cmd_tx.send(SipCommand::Hangup { call_id });
+                    remove_call_if_current(&sip_calls, call_id, instance_id);
+                }
+                return;
+            }
+
+            if !call_is_current(&sip_calls, call_id, instance_id) {
                 return;
             }
 
@@ -1320,6 +1907,11 @@ async fn handle_incoming_call(
 
             // Wait briefly for PJSUA to establish media (conf_port assignment)
             tokio::time::sleep(Duration::from_millis(500)).await;
+
+            if !call_is_current(&sip_calls, call_id, instance_id) {
+                fax_sessions.remove(&call_id);
+                return;
+            }
 
             // Create bidirectional fax audio port
             let audio_ports = crate::fax::audio_port::create_fax_audio_port(call_id).await;
@@ -1376,9 +1968,16 @@ async fn handle_incoming_call(
                     "Guild {} already has active bridge to channel {} (call {} tried to join channel {})",
                     guild_id, existing_channel_id, call_id, channel_id
                 );
-                play_error_and_hangup(call_id, CallError::ServerBusy, &sound_manager, &sip_cmd_tx)
-                    .await;
-                sip_calls.remove(&call_id);
+                play_error_and_hangup(
+                    call_id,
+                    instance_id,
+                    CallError::ServerBusy,
+                    &sound_manager,
+                    &sip_cmd_tx,
+                    &sip_calls,
+                )
+                .await;
+                remove_call_if_current(&sip_calls, call_id, instance_id);
                 return;
             }
 
@@ -1399,21 +1998,18 @@ async fn handle_incoming_call(
                     .clone();
 
                 // Wait for notification with timeout (instant wake-up when bridge is ready)
-                let wait_result = tokio::time::timeout(Duration::from_secs(15), async {
-                    loop {
-                        // Check if bridge is ready or pending cleared
-                        if bridges.contains_key(&channel_id)
-                            || !pending_bridges.contains(&channel_id)
-                        {
-                            return true;
-                        }
-                        // Check if call ended while waiting
-                        if !sip_calls.contains_key(&call_id) {
-                            return false;
-                        }
-                        notify.notified().await;
-                    }
-                })
+                let wait_result = tokio::time::timeout(
+                    Duration::from_secs(15),
+                    wait_for_pending_bridge(
+                        channel_id,
+                        call_id,
+                        instance_id,
+                        bridges.clone(),
+                        pending_bridges.clone(),
+                        sip_calls.clone(),
+                        notify,
+                    ),
+                )
                 .await;
 
                 match wait_result {
@@ -1434,12 +2030,14 @@ async fn handle_incoming_call(
                         );
                         play_error_and_hangup(
                             call_id,
+                            instance_id,
                             CallError::Unknown,
                             &sound_manager,
                             &sip_cmd_tx,
+                            &sip_calls,
                         )
                         .await;
-                        sip_calls.remove(&call_id);
+                        remove_call_if_current(&sip_calls, call_id, instance_id);
                         return;
                     }
                 }
@@ -1449,7 +2047,7 @@ async fn handle_incoming_call(
 
             if bridge_exists {
                 // Join existing bridge
-                if !sip_calls.contains_key(&call_id) {
+                if !call_is_current(&sip_calls, call_id, instance_id) {
                     warn!("Call {} ended during routing, not joining bridge", call_id);
                     return;
                 }
@@ -1459,7 +2057,9 @@ async fn handle_incoming_call(
                     call_id, channel_id
                 );
 
-                if let Some(mut call) = sip_calls.get_mut(&call_id) {
+                if let Some(mut call) = sip_calls.get_mut(&call_id)
+                    && call.instance_id == instance_id
+                {
                     call.channel_id = Some(channel_id);
                     call._user_id = Some(user_id.clone());
                     call._guild_id = Some(guild_id);
@@ -1490,12 +2090,11 @@ async fn handle_incoming_call(
                     backend.on_call_started(&info).await;
                 });
 
-                // Answer call first, then play join sound
-                let _ = sip_cmd_tx.send(SipCommand::Answer { call_id });
-                play_discord_join(call_id, &sound_manager, &sip_cmd_tx).await;
+                // Channel mapping is committed before the final SIP answer.
+                answer_connected_call(call_id, &sound_manager, &sip_cmd_tx);
             } else {
                 // Create new bridge
-                if !sip_calls.contains_key(&call_id) {
+                if !call_is_current(&sip_calls, call_id, instance_id) {
                     warn!("Call {} ended during routing, not creating bridge", call_id);
                     return;
                 }
@@ -1511,12 +2110,14 @@ async fn handle_incoming_call(
                     );
                     play_error_and_hangup(
                         call_id,
+                        instance_id,
                         CallError::ServerBusy,
                         &sound_manager,
                         &sip_cmd_tx,
+                        &sip_calls,
                     )
                     .await;
-                    sip_calls.remove(&call_id);
+                    remove_call_if_current(&sip_calls, call_id, instance_id);
                     return;
                 };
                 info!(
@@ -1536,7 +2137,7 @@ async fn handle_incoming_call(
                 .await
                 {
                     Ok(connection) => {
-                        if !sip_calls.contains_key(&call_id) {
+                        if !call_is_current(&sip_calls, call_id, instance_id) {
                             warn!("Call {} ended while connecting to Discord", call_id);
                             connection.disconnect().await;
                             return;
@@ -1564,7 +2165,9 @@ async fn handle_incoming_call(
                             },
                         );
 
-                        if let Some(mut call) = sip_calls.get_mut(&call_id) {
+                        if let Some(mut call) = sip_calls.get_mut(&call_id)
+                            && call.instance_id == instance_id
+                        {
                             call.channel_id = Some(channel_id);
                             call._user_id = Some(user_id.clone());
                             call._guild_id = Some(guild_id);
@@ -1585,21 +2188,23 @@ async fn handle_incoming_call(
                             backend.on_call_started(&info).await;
                         });
 
-                        // Answer call first, then play join sound
-                        let _ = sip_cmd_tx.send(SipCommand::Answer { call_id });
-                        play_discord_join(call_id, &sound_manager, &sip_cmd_tx).await;
+                        // Ring buffers, bridge ownership, and channel mapping are
+                        // committed before the final SIP answer.
+                        answer_connected_call(call_id, &sound_manager, &sip_cmd_tx);
                     }
                     Err(e) => {
                         error!("Failed to connect to Discord for call {}: {}", call_id, e);
 
                         play_error_and_hangup(
                             call_id,
+                            instance_id,
                             CallError::Unknown,
                             &sound_manager,
                             &sip_cmd_tx,
+                            &sip_calls,
                         )
                         .await;
-                        sip_calls.remove(&call_id);
+                        remove_call_if_current(&sip_calls, call_id, instance_id);
                     }
                 }
             }
@@ -1682,9 +2287,11 @@ async fn handle_outbound_call_answered(
     );
 
     // Step 3: Track the SIP call
+    let instance_id = next_call_instance_id();
     sip_calls.insert(
         call_id,
         SipCallInfo {
+            instance_id,
             channel_id: None,
             _user_id: None,
             _guild_id: Some(guild_id),
@@ -1728,7 +2335,7 @@ async fn handle_outbound_call_answered(
             OutboundCallStatus::Failed(OutboundCallFailureReason::Internal),
         );
         let _ = sip_cmd_tx.send(SipCommand::Hangup { call_id });
-        sip_calls.remove(&call_id);
+        remove_call_if_current(&sip_calls, call_id, instance_id);
         return;
     }
 
@@ -1748,7 +2355,7 @@ async fn handle_outbound_call_answered(
                 OutboundCallStatus::Failed(OutboundCallFailureReason::Internal),
             );
             let _ = sip_cmd_tx.send(SipCommand::Hangup { call_id });
-            sip_calls.remove(&call_id);
+            remove_call_if_current(&sip_calls, call_id, instance_id);
             return;
         };
         info!(
@@ -1768,7 +2375,7 @@ async fn handle_outbound_call_answered(
         .await
         {
             Ok(connection) => {
-                if !sip_calls.contains_key(&call_id) {
+                if !call_is_current(&sip_calls, call_id, instance_id) {
                     warn!(
                         "Outbound call {} ended while connecting to Discord",
                         call_id
@@ -1802,16 +2409,25 @@ async fn handle_outbound_call_answered(
                     },
                 );
 
-                if let Some(mut call) = sip_calls.get_mut(&call_id) {
+                if let Some(mut call) = sip_calls.get_mut(&call_id)
+                    && call.instance_id == instance_id
+                {
                     call.channel_id = Some(channel_id);
                     call._guild_id = Some(guild_id);
                 }
 
                 register_call_channel(call_id, channel_id);
                 backend.report_call_status(&req.call_id, OutboundCallStatus::Connected);
-                play_discord_join(call_id, &sound_manager, &sip_cmd_tx).await;
+                play_discord_join(call_id, &sound_manager, &sip_cmd_tx);
             }
             Err(e) => {
+                if !call_is_current(&sip_calls, call_id, instance_id) {
+                    warn!(
+                        "Ignoring late Discord connection failure for reused outbound call ID {}",
+                        call_id
+                    );
+                    return;
+                }
                 error!(
                     "Failed to connect to Discord for outbound call {}: {}",
                     call_id, e
@@ -1821,14 +2437,39 @@ async fn handle_outbound_call_answered(
                     OutboundCallStatus::Failed(OutboundCallFailureReason::Internal),
                 );
                 let _ = sip_cmd_tx.send(SipCommand::Hangup { call_id });
-                sip_calls.remove(&call_id);
+                remove_call_if_current(&sip_calls, call_id, instance_id);
             }
         }
     }
 }
 
 /// Play the discord join sound
-async fn play_discord_join(
+fn queue_connected_call_audio(
+    call_id: CallId,
+    join_samples: Option<Vec<i16>>,
+    sip_cmd_tx: &Sender<SipCommand>,
+) {
+    let _ = sip_cmd_tx.send(SipCommand::Answer { call_id });
+    if let Some(samples) = join_samples {
+        let _ = sip_cmd_tx.send(SipCommand::PlayDirectToCall { call_id, samples });
+    }
+}
+
+fn answer_connected_call(
+    call_id: CallId,
+    sound_manager: &SoundManager,
+    sip_cmd_tx: &Sender<SipCommand>,
+) {
+    let join_samples = sound_manager
+        .get_discord_join_samples()
+        .map(|samples| (*samples).clone());
+    if join_samples.is_none() {
+        warn!("No discord_join sound configured");
+    }
+    queue_connected_call_audio(call_id, join_samples, sip_cmd_tx);
+}
+
+fn play_discord_join(
     call_id: CallId,
     sound_manager: &SoundManager,
     sip_cmd_tx: &Sender<SipCommand>,
@@ -1847,16 +2488,26 @@ async fn play_discord_join(
 /// Play an error sound and hangup
 async fn play_error_and_hangup(
     call_id: CallId,
+    instance_id: CallInstanceId,
     error: CallError,
     sound_manager: &SoundManager,
     sip_cmd_tx: &Sender<SipCommand>,
+    sip_calls: &DashMap<CallId, SipCallInfo>,
 ) {
     info!("Playing error audio for call {}: {:?}", call_id, error);
+
+    if !call_is_current(sip_calls, call_id, instance_id) {
+        return;
+    }
 
     // The call was already answered with 183, so we can play audio
     // Send 200 OK to fully answer before playing error
     let _ = sip_cmd_tx.send(SipCommand::Answer { call_id });
     tokio::time::sleep(Duration::from_millis(200)).await;
+
+    if !call_is_current(sip_calls, call_id, instance_id) {
+        return;
+    }
 
     if let Some(samples) = sound_manager.get_error_samples(error.sound_name()) {
         let _ = sip_cmd_tx.send(SipCommand::PlayDirectToCall {
@@ -1872,7 +2523,9 @@ async fn play_error_and_hangup(
     }
 
     info!("Hanging up call {} after error audio", call_id);
-    let _ = sip_cmd_tx.send(SipCommand::Hangup { call_id });
+    if call_is_current(sip_calls, call_id, instance_id) {
+        let _ = sip_cmd_tx.send(SipCommand::Hangup { call_id });
+    }
 }
 
 /// Play an extension-based sound (easter egg) and hangup
@@ -1887,11 +2540,17 @@ async fn play_extension_sound_and_hangup(
     sound_name: &str,
     sound_manager: &SoundManager,
     sip_cmd_tx: &Sender<SipCommand>,
+    sip_calls: &DashMap<CallId, SipCallInfo>,
+    instance_id: CallInstanceId,
 ) {
     info!(
         "Playing extension sound '{}' for call {}",
         sound_name, call_id
     );
+
+    if !call_is_current(sip_calls, call_id, instance_id) {
+        return;
+    }
 
     // Answer the call first
     // NOTE: Previously had 200ms delay here which caused RTP timestamp debt
@@ -1943,7 +2602,9 @@ async fn play_extension_sound_and_hangup(
     }
 
     info!("Hanging up call {} after extension sound", call_id);
-    let _ = sip_cmd_tx.send(SipCommand::Hangup { call_id });
+    if call_is_current(sip_calls, call_id, instance_id) {
+        let _ = sip_cmd_tx.send(SipCommand::Hangup { call_id });
+    }
 }
 
 /// Wake up any tasks waiting for a bridge to become ready for the given channel.

@@ -42,7 +42,7 @@ impl fmt::Display for MediaDir {
     }
 }
 use super::channel_audio::{
-    complete_pending_channel_registration, disconnect_call_for_hold, get_channel_slot,
+    complete_pending_channel_registration, disconnect_call_for_hold, mark_call_needs_reconnect,
 };
 use super::ffi::types::*;
 use super::ffi::utils::{extract_sip_username, pj_str_to_string};
@@ -766,64 +766,14 @@ pub unsafe extern "C" fn on_call_media_state_cb(raw_call_id: pjsua_call_id) {
                         }
                     };
 
-                    if let Some(channel_id) = channel_id {
-                        // Reconnect to channel port (bidirectional)
-                        if let Some(channel_slot) = get_channel_slot(channel_id) {
-                            // Disconnect old (both directions)
-                            pjsua_conf_disconnect(*channel_slot, *old_port);
-                            pjsua_conf_disconnect(*old_port, *channel_slot);
-                            // Connect new (both directions)
-                            pjsua_conf_connect(*channel_slot, *conf_port);
-                            pjsua_conf_connect(*conf_port, *channel_slot);
-                            tracing::info!(
-                                "Reconnected channel {} port (slot {}) <-> call {} (new port {})",
-                                channel_id,
-                                channel_slot,
-                                call_id,
-                                conf_port
-                            );
-                        }
-
-                        // Reconnect to other calls in the same channel
-                        let other_calls: Vec<(CallId, ConfPort)> = {
-                            let channel_calls = CHANNEL_CALLS.get();
-                            let call_ports = CALL_CONF_PORTS.get();
-                            if let (Some(cc), Some(cp)) = (channel_calls, call_ports) {
-                                let cc_guard = cc.read();
-                                if let Some(calls) = cc_guard.get(&channel_id) {
-                                    calls
-                                        .iter()
-                                        .filter(|&&other_id| other_id != call_id)
-                                        .filter_map(|&other_id| {
-                                            cp.get(&other_id).map(|r| (other_id, *r))
-                                        })
-                                        .collect()
-                                } else {
-                                    vec![]
-                                }
-                            } else {
-                                vec![]
-                            }
-                        };
-
-                        for (other_id, other_port) in other_calls {
-                            // Disconnect old bidirectional connections
-                            pjsua_conf_disconnect(*old_port, *other_port);
-                            pjsua_conf_disconnect(*other_port, *old_port);
-
-                            // Connect new bidirectional connections
-                            pjsua_conf_connect(*conf_port, *other_port);
-                            pjsua_conf_connect(*other_port, *conf_port);
-
-                            tracing::info!(
-                                "Reconnected call {} (new port {}) <-> call {} (port {}) in channel {}",
-                                call_id,
-                                conf_port,
-                                other_id,
-                                other_port,
-                                channel_id
-                            );
-                        }
+                    if let Some(channel_id) = channel_id
+                        && mark_call_needs_reconnect(call_id, channel_id)
+                    {
+                        tracing::info!(
+                            "Call {} removed from active channel {} pending audio-thread reconnection",
+                            call_id,
+                            channel_id
+                        );
                     }
                 }
 
@@ -877,21 +827,12 @@ pub unsafe extern "C" fn on_call_media_state_cb(raw_call_id: pjsua_call_id) {
                     && let Some(channel_id) = CALL_CHANNELS
                         .get()
                         .and_then(|c| c.get(&call_id).map(|r| *r))
+                    && mark_call_needs_reconnect(call_id, channel_id)
                 {
-                    let channel_calls = CHANNEL_CALLS
-                        .get_or_init(|| parking_lot::RwLock::new(std::collections::HashMap::new()));
-                    let mut map = channel_calls.write();
-                    if let Some(calls) = map.get_mut(&channel_id)
-                        && calls.remove(&call_id)
-                    {
-                        if calls.is_empty() {
-                            map.remove(&channel_id);
-                        }
-                        tracing::info!(
-                            "Call {} returning from hold - removed from CHANNEL_CALLS for fresh reconnection",
-                            call_id
-                        );
-                    }
+                    tracing::info!(
+                        "Call {} returning from hold - removed from CHANNEL_CALLS for fresh reconnection",
+                        call_id
+                    );
                 }
 
                 // If the call was already registered with a channel (Discord connected before

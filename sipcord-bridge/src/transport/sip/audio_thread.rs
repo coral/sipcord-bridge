@@ -10,7 +10,6 @@ use super::ffi::types::*;
 use crate::audio::simd;
 use crate::services::snowflake::Snowflake;
 use crossbeam_channel::Sender;
-use crossbeam_queue::SegQueue;
 use parking_lot::Mutex;
 use pjsua::*;
 use std::mem::MaybeUninit;
@@ -21,18 +20,20 @@ use std::time::Instant;
 /// This is reset when the audio thread starts to prevent subtraction overflow
 static FIRST_ACTIVE_CHANNEL_FRAME: AtomicU64 = AtomicU64::new(0);
 
-fn drain_queue<T>(queue: &SegQueue<T>, name: &str) {
-    let mut count = 0;
-    while queue.pop().is_some() {
-        count += 1;
+const MAX_QUEUE_ITEMS_PER_FRAME: usize = 256;
+const CONF_RETRY_INTERVAL_FRAMES: u64 = 5;
+const MAX_CONF_CONNECTION_ATTEMPTS: u16 = 50;
+
+fn prepare_conf_connection_retry(
+    pending: &mut PendingConfConnection,
+    frame_count: u64,
+) -> bool {
+    pending.attempts = pending.attempts.saturating_add(1);
+    if pending.attempts >= MAX_CONF_CONNECTION_ATTEMPTS {
+        return false;
     }
-    if count > 0 {
-        tracing::warn!(
-            "Drained {} stale {} from previous audio thread",
-            count,
-            name
-        );
-    }
+    pending.not_before_frame = frame_count.saturating_add(CONF_RETRY_INTERVAL_FRAMES);
+    true
 }
 
 /// Start the audio processing thread
@@ -60,11 +61,6 @@ pub fn start_audio_thread() {
                 "Audio processing thread started [thread: {:?}]",
                 std::thread::current().id()
             );
-
-            // Drain stale ops from previous audio thread lifecycle
-            drain_queue(&PENDING_PJSUA_OPS, "PENDING_PJSUA_OPS");
-            drain_queue(&PENDING_CONF_CONNECTIONS, "PENDING_CONF_CONNECTIONS");
-            drain_queue(&PENDING_CHANNEL_COMPLETIONS, "PENDING_CHANNEL_COMPLETIONS");
 
             // Register this thread with PJLIB so we can call PJSUA functions
             // The thread descriptor must remain valid for the thread's lifetime
@@ -260,7 +256,10 @@ pub fn stop_audio_thread() {
 /// Called from the audio thread after it has processed its first frame
 fn process_pending_channel_completions() {
     let mut count = 0;
-    while let Some((call_id, conf_port)) = PENDING_CHANNEL_COMPLETIONS.pop() {
+    while count < MAX_QUEUE_ITEMS_PER_FRAME {
+        let Some((call_id, conf_port)) = PENDING_CHANNEL_COMPLETIONS.pop() else {
+            break;
+        };
         tracing::debug!(
             "Completing deferred channel registration: call {} -> conf_port {}",
             call_id,
@@ -279,18 +278,56 @@ fn process_pending_channel_completions() {
 
 /// Process any pending conference connections
 /// Called from the audio thread every frame to handle newly registered calls
-fn process_pending_conf_connections(_frame_count: u64) {
-    use super::channel_audio::complete_conf_connections;
+fn process_pending_conf_connections(frame_count: u64) {
+    use super::channel_audio::{
+        ConfConnectionResult, complete_conf_connections, conf_connection_is_current,
+    };
 
     let mut count = 0;
-    while let Some((call_id, channel_id)) = PENDING_CONF_CONNECTIONS.pop() {
+    let mut deferred = Vec::new();
+    while count < MAX_QUEUE_ITEMS_PER_FRAME {
+        let Some(mut pending) = PENDING_CONF_CONNECTIONS.pop() else {
+            break;
+        };
+        if pending.not_before_frame > frame_count {
+            deferred.push(pending);
+            count += 1;
+            continue;
+        }
+
         tracing::debug!(
             "Audio thread making conference connections: call {} -> channel {}",
-            call_id,
-            channel_id
+            pending.call_id,
+            pending.channel_id
         );
-        complete_conf_connections(call_id, channel_id);
+        match complete_conf_connections(pending) {
+            ConfConnectionResult::Connected | ConfConnectionResult::Stale => {}
+            ConfConnectionResult::Retry => {
+                if !prepare_conf_connection_retry(&mut pending, frame_count) {
+                    if !conf_connection_is_current(pending) {
+                        count += 1;
+                        continue;
+                    }
+                    tracing::error!(
+                        "Conference connection failed after {} attempts; hanging up call {}",
+                        pending.attempts,
+                        pending.call_id
+                    );
+                    PENDING_PJSUA_OPS.push(PendingPjsuaOp::Hangup {
+                        call_id: pending.call_id,
+                    });
+                } else {
+                    deferred.push(pending);
+                }
+            }
+        }
         count += 1;
+    }
+
+    // Requeue only after the current bounded batch. Retried work can therefore
+    // never spin forever in a single 20ms audio frame.
+    for pending in deferred {
+        PENDING_CONF_CONNECTIONS.push(pending);
     }
 
     if count > 0 {
@@ -351,7 +388,10 @@ fn process_pending_pjsua_ops() {
     use super::ffi::streaming_player::start_streaming_to_call;
 
     let mut count = 0;
-    while let Some(op) = PENDING_PJSUA_OPS.pop() {
+    while count < MAX_QUEUE_ITEMS_PER_FRAME {
+        let Some(op) = PENDING_PJSUA_OPS.pop() else {
+            break;
+        };
         // Validate that the call still exists before processing the op
         let call_id = match &op {
             PendingPjsuaOp::PlayDirect { call_id, .. } => Some(*call_id),
@@ -898,4 +938,43 @@ pub fn cleanup_zombie_pjsua_calls() -> usize {
     }
 
     cleaned
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn conference_retry_is_delayed_to_a_later_audio_frame() {
+        let mut pending =
+            PendingConfConnection::new(CallId::new(40_001), Snowflake::new(40_002), 1);
+
+        assert!(prepare_conf_connection_retry(&mut pending, 100));
+        assert_eq!(pending.attempts, 1);
+        assert_eq!(pending.not_before_frame, 100 + CONF_RETRY_INTERVAL_FRAMES);
+    }
+
+    #[test]
+    fn conference_retry_budget_is_bounded() {
+        let mut pending = PendingConfConnection {
+            call_id: CallId::new(40_003),
+            channel_id: Snowflake::new(40_004),
+            registration_id: 1,
+            attempts: MAX_CONF_CONNECTION_ATTEMPTS - 1,
+            not_before_frame: 0,
+        };
+
+        assert!(!prepare_conf_connection_retry(&mut pending, 100));
+        assert_eq!(pending.attempts, MAX_CONF_CONNECTION_ATTEMPTS);
+        assert_eq!(pending.not_before_frame, 0);
+    }
+
+    #[test]
+    fn retry_frame_calculation_cannot_overflow() {
+        let mut pending =
+            PendingConfConnection::new(CallId::new(40_005), Snowflake::new(40_006), 1);
+
+        assert!(prepare_conf_connection_retry(&mut pending, u64::MAX));
+        assert_eq!(pending.not_before_frame, u64::MAX);
+    }
 }

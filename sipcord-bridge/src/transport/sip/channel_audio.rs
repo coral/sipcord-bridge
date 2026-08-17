@@ -15,7 +15,7 @@ use rtrb::Consumer;
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::sync::OnceLock;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 // Discord→SIP ring buffer consumers (written by Discord, read by audio thread)
@@ -25,6 +25,8 @@ use std::time::{Duration, Instant};
 /// channel_port_get_frame reads from the consumer side here.
 static DISCORD_TO_SIP_CONSUMERS: OnceLock<DashMap<Snowflake, Mutex<Consumer<i16>>>> =
     OnceLock::new();
+static NEXT_CHANNEL_REGISTRATION_ID: AtomicU64 = AtomicU64::new(1);
+static CHANNEL_REGISTRATION_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 fn get_discord_to_sip_consumers() -> &'static DashMap<Snowflake, Mutex<Consumer<i16>>> {
     DISCORD_TO_SIP_CONSUMERS.get_or_init(DashMap::new)
@@ -183,7 +185,10 @@ pub unsafe extern "C" fn channel_port_get_frame(
 /// Get samples from the Discord→SIP ring buffer for a channel.
 /// Fills the caller-provided buffer and returns the number of samples written.
 /// `buf` must be at least SAMPLES_PER_FRAME in length.
-fn get_samples_from_buffer(channel_id: Snowflake, buf: &mut [i16; SAMPLES_PER_FRAME]) -> usize {
+pub(crate) fn get_samples_from_buffer(
+    channel_id: Snowflake,
+    buf: &mut [i16; SAMPLES_PER_FRAME],
+) -> usize {
     use std::sync::atomic::AtomicU64;
     static DRAIN_COUNT: AtomicU64 = AtomicU64::new(0);
     static UNDERRUN_COUNT: AtomicU64 = AtomicU64::new(0);
@@ -236,6 +241,9 @@ fn get_samples_from_buffer(channel_id: Snowflake, buf: &mut [i16; SAMPLES_PER_FR
         }
     }
 
+    // Callers are allowed to reuse their frame buffer. Never leak samples from a
+    // previous channel/frame when the consumer is absent or briefly contended.
+    buf.fill(0);
     0 // No audio available
 }
 
@@ -351,7 +359,9 @@ unsafe fn connect_call_to_channel(
     conf_port: ConfPort,
     channel_id: Snowflake,
     other_calls: &[(CallId, ConfPort)],
-) {
+) -> bool {
+    let mut all_connected = true;
+
     // Connect this call to other calls in the same channel
     for &(other_call_id, other_conf_port) in other_calls {
         let (status1, status2) = unsafe {
@@ -372,6 +382,7 @@ unsafe fn connect_call_to_channel(
                 channel_id
             );
         } else {
+            all_connected = false;
             tracing::warn!(
                 "Failed to connect calls {} and {} in channel {}: status1={}, status2={}",
                 call_id,
@@ -395,6 +406,7 @@ unsafe fn connect_call_to_channel(
         };
 
         if status1 != pj_constants__PJ_SUCCESS as i32 {
+            all_connected = false;
             tracing::warn!(
                 "Failed to connect channel {} slot {} -> call {}: {}",
                 channel_id,
@@ -404,6 +416,7 @@ unsafe fn connect_call_to_channel(
             );
         }
         if status2 != pj_constants__PJ_SUCCESS as i32 {
+            all_connected = false;
             tracing::warn!(
                 "Failed to connect call {} -> channel {} slot {}: {}",
                 call_id,
@@ -422,7 +435,16 @@ unsafe fn connect_call_to_channel(
                 conf_port
             );
         }
+    } else {
+        all_connected = false;
+        tracing::warn!(
+            "Could not create conference port for channel {} while connecting call {}",
+            channel_id,
+            call_id
+        );
     }
+
+    all_connected
 }
 
 /// Disconnect a call from other calls in the channel + channel port.
@@ -476,17 +498,37 @@ unsafe fn disconnect_call_from_channel(
 ///
 /// This function:
 /// 1. Stores the call -> channel mapping (always, even if media not ready)
-/// 2. Adds the call to the channel's call set
-/// 3. Queues the conference connections for the audio thread to process
+/// 2. Queues the conference connections for the audio thread to process
 ///    (pjsua_conf_connect conflicts with pjmedia_port_get_frame if called from different threads)
+/// 3. Adds the call to the active channel set only after PJSUA confirms all connections
 pub fn register_call_channel(call_id: CallId, channel_id: Snowflake) {
+    let _registration_guard = CHANNEL_REGISTRATION_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock();
     // Always store the call -> channel mapping first, even if media isn't ready yet
     // This allows complete_pending_channel_registration to finish the job when media becomes active
-    {
+    let registration_id = {
         let channels = CALL_CHANNELS.get_or_init(DashMap::new);
-        channels.insert(call_id, channel_id);
+        if let Some(existing) = channels.get(&call_id) {
+            if *existing != channel_id {
+                tracing::error!(
+                    "Refusing to reassign active call {} from channel {} to channel {}",
+                    call_id,
+                    *existing,
+                    channel_id
+                );
+                return;
+            }
+        } else {
+            channels.insert(call_id, channel_id);
+        }
+        let registrations = CALL_CHANNEL_REGISTRATIONS.get_or_init(DashMap::new);
+        let registration_id = *registrations
+            .entry(call_id)
+            .or_insert_with(|| NEXT_CHANNEL_REGISTRATION_ID.fetch_add(1, Ordering::Relaxed));
         tracing::debug!("Stored call {} -> channel {} mapping", call_id, channel_id);
-    }
+        registration_id
+    };
 
     // Get the conf_port for this call
     let conf_port = {
@@ -503,24 +545,14 @@ pub fn register_call_channel(call_id: CallId, channel_id: Snowflake) {
         return;
     };
 
-    // Add call to channel's call set (this enables audio buffering for this channel)
-    {
-        let channel_calls = CHANNEL_CALLS.get_or_init(|| RwLock::new(HashMap::new()));
-        let mut map = channel_calls.write();
-        let calls = map.entry(channel_id).or_default();
-        calls.insert(call_id);
-        tracing::debug!(
-            "Added call {} to channel {} ({} calls in channel)",
-            call_id,
-            channel_id,
-            calls.len()
-        );
-    }
-
     // Queue the conference connections to be made by the audio thread
     // This is necessary because pjsua_conf_connect conflicts with the audio thread's
     // pjmedia_port_get_frame calls if made from a different thread
-    PENDING_CONF_CONNECTIONS.push((call_id, channel_id));
+    PENDING_CONF_CONNECTIONS.push(PendingConfConnection::new(
+        call_id,
+        channel_id,
+        registration_id,
+    ));
     tracing::debug!(
         "Queued conference connections for call {} -> channel {} (will be processed by audio thread)",
         call_id,
@@ -533,7 +565,45 @@ pub fn register_call_channel(call_id: CallId, channel_id: Snowflake) {
 /// This makes the actual conference connections that were queued by register_call_channel.
 /// Must be called from the audio thread to avoid conflicts with pjmedia_port_get_frame.
 /// Uses pjmedia_conf_connect_port directly to bypass PJSUA_LOCK (avoiding deadlocks).
-pub fn complete_conf_connections(call_id: CallId, channel_id: Snowflake) {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfConnectionResult {
+    Connected,
+    Retry,
+    Stale,
+}
+
+pub(crate) fn conf_connection_is_current(pending: PendingConfConnection) -> bool {
+    let current_channel = CALL_CHANNELS
+        .get_or_init(DashMap::new)
+        .get(&pending.call_id)
+        .map(|entry| *entry);
+    let current_registration = CALL_CHANNEL_REGISTRATIONS
+        .get_or_init(DashMap::new)
+        .get(&pending.call_id)
+        .map(|entry| *entry);
+    current_channel == Some(pending.channel_id)
+        && current_registration == Some(pending.registration_id)
+}
+
+pub fn complete_conf_connections(pending: PendingConfConnection) -> ConfConnectionResult {
+    let call_id = pending.call_id;
+    let channel_id = pending.channel_id;
+    // A queued entry may outlive its call, or the call may have been reassigned.
+    // Validate before touching PJSUA so teardown cannot resurrect a stale channel.
+    if !conf_connection_is_current(pending) {
+        tracing::debug!(
+            "Ignoring stale conference connection: call {} queued for channel {} generation {}",
+            call_id,
+            channel_id,
+            pending.registration_id
+        );
+        return ConfConnectionResult::Stale;
+    }
+
+    if is_call_connected(call_id, channel_id) {
+        return ConfConnectionResult::Connected;
+    }
+
     // Get the conf_port for this call
     let conf_port = {
         let ports = CALL_CONF_PORTS.get_or_init(DashMap::new);
@@ -545,7 +615,7 @@ pub fn complete_conf_connections(call_id: CallId, channel_id: Snowflake) {
             "complete_conf_connections: call {} has no conf_port - skipping",
             call_id
         );
-        return;
+        return ConfConnectionResult::Retry;
     };
 
     // Get the conference bridge pointer (needed for pjmedia_conf_connect_port)
@@ -555,7 +625,7 @@ pub fn complete_conf_connections(call_id: CallId, channel_id: Snowflake) {
             "complete_conf_connections: could not get conference bridge pointer for call {}",
             call_id
         );
-        return;
+        return ConfConnectionResult::Retry;
     };
 
     // Get other calls in this channel to connect bidirectionally
@@ -574,8 +644,18 @@ pub fn complete_conf_connections(call_id: CallId, channel_id: Snowflake) {
         }
     };
 
-    unsafe {
-        connect_call_to_channel(conf, call_id, conf_port, channel_id, &other_calls);
+    let connected = unsafe {
+        connect_call_to_channel(conf, call_id, conf_port, channel_id, &other_calls)
+    };
+
+    if !connected {
+        return ConfConnectionResult::Retry;
+    }
+
+    // Revalidate after the FFI calls. Teardown may have raced while PJSUA was
+    // connecting; in that case the completed link is no longer considered active.
+    if !mark_call_connected_if_current(call_id, channel_id, pending.registration_id) {
+        return ConfConnectionResult::Stale;
     }
 
     tracing::debug!(
@@ -584,6 +664,62 @@ pub fn complete_conf_connections(call_id: CallId, channel_id: Snowflake) {
         conf_port,
         channel_id
     );
+    ConfConnectionResult::Connected
+}
+
+fn is_call_connected(call_id: CallId, channel_id: Snowflake) -> bool {
+    CHANNEL_CALLS
+        .get_or_init(|| RwLock::new(HashMap::new()))
+        .read()
+        .get(&channel_id)
+        .is_some_and(|calls| calls.contains(&call_id))
+}
+
+fn mark_call_connected_if_current(
+    call_id: CallId,
+    channel_id: Snowflake,
+    registration_id: u64,
+) -> bool {
+    let current_channel = CALL_CHANNELS
+        .get_or_init(DashMap::new)
+        .get(&call_id)
+        .map(|entry| *entry);
+    let current_registration = CALL_CHANNEL_REGISTRATIONS
+        .get_or_init(DashMap::new)
+        .get(&call_id)
+        .map(|entry| *entry);
+    if current_channel != Some(channel_id) || current_registration != Some(registration_id) {
+        return false;
+    }
+
+    let channel_calls = CHANNEL_CALLS.get_or_init(|| RwLock::new(HashMap::new()));
+    let mut map = channel_calls.write();
+    map.entry(channel_id).or_default().insert(call_id);
+    true
+}
+
+/// Mark an existing call/channel link as needing a fresh conference connection.
+/// The media callback uses this for hold recovery and conf-port changes; the
+/// normal pending-registration path then queues the actual PJSUA work.
+pub(crate) fn mark_call_needs_reconnect(call_id: CallId, channel_id: Snowflake) -> bool {
+    let current_channel = CALL_CHANNELS
+        .get_or_init(DashMap::new)
+        .get(&call_id)
+        .map(|entry| *entry);
+    if current_channel != Some(channel_id) {
+        return false;
+    }
+
+    let channel_calls = CHANNEL_CALLS.get_or_init(|| RwLock::new(HashMap::new()));
+    let mut map = channel_calls.write();
+    let Some(calls) = map.get_mut(&channel_id) else {
+        return false;
+    };
+    let removed = calls.remove(&call_id);
+    if calls.is_empty() {
+        map.remove(&channel_id);
+    }
+    removed
 }
 
 /// Complete a pending channel registration when media becomes active
@@ -606,17 +742,19 @@ pub fn complete_pending_channel_registration(call_id: CallId, conf_port: ConfPor
         );
         return;
     };
-
-    // Check if already in CHANNEL_CALLS (already connected)
-    let already_connected = {
-        let channel_calls = CHANNEL_CALLS.get_or_init(|| RwLock::new(HashMap::new()));
-        let map = channel_calls.read();
-        map.get(&channel_id)
-            .map(|calls| calls.contains(&call_id))
-            .unwrap_or(false)
+    let Some(registration_id) = CALL_CHANNEL_REGISTRATIONS
+        .get_or_init(DashMap::new)
+        .get(&call_id)
+        .map(|entry| *entry)
+    else {
+        tracing::debug!(
+            "complete_pending_channel_registration: call {} has no live registration generation",
+            call_id
+        );
+        return;
     };
 
-    if already_connected {
+    if is_call_connected(call_id, channel_id) {
         tracing::debug!(
             "Call {} already connected to channel {} - skipping",
             call_id,
@@ -632,43 +770,18 @@ pub fn complete_pending_channel_registration(call_id: CallId, conf_port: ConfPor
         conf_port
     );
 
-    // Get existing calls in this channel and add our call
-    let existing_calls: Vec<CallId> = {
-        let channel_calls = CHANNEL_CALLS.get_or_init(|| RwLock::new(HashMap::new()));
-        let mut map = channel_calls.write();
-        let calls = map.entry(channel_id).or_default();
-        let existing: Vec<CallId> = calls.iter().copied().collect();
-        calls.insert(call_id);
-        existing
-    };
-
-    // Get the conference bridge pointer (needed for pjmedia_conf_connect_port)
-    let conf = unsafe { get_conference_bridge() };
-    let Some(conf) = conf else {
-        tracing::error!(
-            "complete_pending_channel_registration: could not get conference bridge pointer for call {}",
-            call_id
-        );
-        return;
-    };
-
-    // Connect this call to other calls in the same channel + channel port
-    let conf_ports = CALL_CONF_PORTS.get_or_init(DashMap::new);
-    let other_calls: Vec<(CallId, ConfPort)> = existing_calls
-        .iter()
-        .filter_map(|&other_id| conf_ports.get(&other_id).map(|r| (other_id, *r)))
-        .collect();
-
-    unsafe {
-        connect_call_to_channel(conf, call_id, conf_port, channel_id, &other_calls);
-    }
-
+    // Never mutate the conference bridge from the PJSUA callback thread. Queue
+    // the work for the audio thread, which owns all get_frame/connect activity.
+    PENDING_CONF_CONNECTIONS.push(PendingConfConnection::new(
+        call_id,
+        channel_id,
+        registration_id,
+    ));
     tracing::debug!(
-        "Completed pending registration: call {} (port {}) for channel {} ({} total calls)",
+        "Queued pending registration: call {} (port {}) for channel {}",
         call_id,
         conf_port,
-        channel_id,
-        existing_calls.len() + 1
+        channel_id
     );
 }
 
@@ -779,16 +892,18 @@ pub fn disconnect_call_for_hold(call_id: CallId) {
 /// The bridge code should call cleanup_channel_port() when the bridge is destroyed
 /// to avoid race conditions with other calls joining the same channel.
 pub fn unregister_call_channel(call_id: CallId) {
-    // Get and remove the channel_id for this call
-    let channel_id = {
+    let (channel_id, conf_port) = {
+        let _registration_guard = CHANNEL_REGISTRATION_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock();
         let channels = CALL_CHANNELS.get_or_init(DashMap::new);
-        channels.remove(&call_id).map(|(_, v)| v)
-    };
-
-    // Get and remove the conf_port for this call
-    let conf_port = {
+        let channel_id = channels.remove(&call_id).map(|(_, v)| v);
+        CALL_CHANNEL_REGISTRATIONS
+            .get_or_init(DashMap::new)
+            .remove(&call_id);
         let ports = CALL_CONF_PORTS.get_or_init(DashMap::new);
-        ports.remove(&call_id).map(|(_, v)| v)
+        let conf_port = ports.remove(&call_id).map(|(_, v)| v);
+        (channel_id, conf_port)
     };
 
     let Some(channel_id) = channel_id else {
@@ -1064,4 +1179,184 @@ pub fn get_active_channels_into(out: &mut Vec<Snowflake>) {
     let channel_calls = CHANNEL_CALLS.get_or_init(|| RwLock::new(HashMap::new()));
     let map = channel_calls.read();
     out.extend(map.keys());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
+
+    static NEXT_CALL_ID: AtomicI32 = AtomicI32::new(20_000);
+    static NEXT_CHANNEL_ID: AtomicU64 = AtomicU64::new(8_000_000);
+
+    fn unique_call_id() -> CallId {
+        CallId::new(NEXT_CALL_ID.fetch_add(1, Ordering::Relaxed))
+    }
+
+    fn unique_channel_id() -> Snowflake {
+        Snowflake::new(NEXT_CHANNEL_ID.fetch_add(1, Ordering::Relaxed))
+    }
+
+    fn registration_id(call_id: CallId) -> u64 {
+        *CALL_CHANNEL_REGISTRATIONS
+            .get_or_init(DashMap::new)
+            .get(&call_id)
+            .expect("call should have a registration generation")
+    }
+
+    #[test]
+    fn registration_waits_for_media_before_channel_becomes_active() {
+        let call_id = unique_call_id();
+        let channel_id = unique_channel_id();
+
+        register_call_channel(call_id, channel_id);
+
+        assert_eq!(
+            CALL_CHANNELS
+                .get()
+                .and_then(|channels| channels.get(&call_id).map(|entry| *entry)),
+            Some(channel_id)
+        );
+        assert!(!is_call_connected(call_id, channel_id));
+
+        unregister_call_channel(call_id);
+        assert!(!is_call_connected(call_id, channel_id));
+    }
+
+    #[test]
+    fn registration_is_idempotent_but_cannot_reassign_a_live_call() {
+        let call_id = unique_call_id();
+        let first_channel = unique_channel_id();
+        let second_channel = unique_channel_id();
+
+        register_call_channel(call_id, first_channel);
+        register_call_channel(call_id, first_channel);
+        register_call_channel(call_id, second_channel);
+
+        assert_eq!(
+            CALL_CHANNELS
+                .get()
+                .and_then(|channels| channels.get(&call_id).map(|entry| *entry)),
+            Some(first_channel)
+        );
+        assert!(!is_call_connected(call_id, first_channel));
+        assert!(!is_call_connected(call_id, second_channel));
+
+        unregister_call_channel(call_id);
+    }
+
+    #[test]
+    fn stale_connection_completion_cannot_resurrect_unregistered_call() {
+        let call_id = unique_call_id();
+        let channel_id = unique_channel_id();
+
+        register_call_channel(call_id, channel_id);
+        unregister_call_channel(call_id);
+
+        assert!(!mark_call_connected_if_current(call_id, channel_id, u64::MAX));
+        assert!(!is_call_connected(call_id, channel_id));
+    }
+
+    #[test]
+    fn media_renegotiation_moves_connected_call_back_to_pending_state() {
+        let call_id = unique_call_id();
+        let channel_id = unique_channel_id();
+
+        register_call_channel(call_id, channel_id);
+        assert!(mark_call_connected_if_current(
+            call_id,
+            channel_id,
+            registration_id(call_id)
+        ));
+        assert!(is_call_connected(call_id, channel_id));
+
+        assert!(mark_call_needs_reconnect(call_id, channel_id));
+        assert!(!is_call_connected(call_id, channel_id));
+        assert!(!mark_call_needs_reconnect(call_id, channel_id));
+
+        unregister_call_channel(call_id);
+    }
+
+    #[test]
+    fn stale_renegotiation_cannot_disconnect_call_from_current_channel() {
+        let call_id = unique_call_id();
+        let current_channel = unique_channel_id();
+        let stale_channel = unique_channel_id();
+
+        register_call_channel(call_id, current_channel);
+        assert!(mark_call_connected_if_current(
+            call_id,
+            current_channel,
+            registration_id(call_id)
+        ));
+
+        assert!(!mark_call_needs_reconnect(call_id, stale_channel));
+        assert!(is_call_connected(call_id, current_channel));
+
+        unregister_call_channel(call_id);
+    }
+
+    #[test]
+    fn queued_connection_from_reused_call_id_is_rejected_by_generation() {
+        let call_id = unique_call_id();
+        let channel_id = unique_channel_id();
+
+        register_call_channel(call_id, channel_id);
+        let old_registration = registration_id(call_id);
+        unregister_call_channel(call_id);
+
+        register_call_channel(call_id, channel_id);
+        let new_registration = registration_id(call_id);
+        assert_ne!(old_registration, new_registration);
+
+        let stale = PendingConfConnection::new(call_id, channel_id, old_registration);
+        assert_eq!(
+            complete_conf_connections(stale),
+            ConfConnectionResult::Stale
+        );
+        assert!(!is_call_connected(call_id, channel_id));
+
+        unregister_call_channel(call_id);
+    }
+
+    #[test]
+    fn empty_or_missing_ring_buffer_always_zeroes_reused_frame() {
+        let channel_id = unique_channel_id();
+        let mut frame = [123_i16; SAMPLES_PER_FRAME];
+
+        assert_eq!(get_samples_from_buffer(channel_id, &mut frame), 0);
+        assert_eq!(frame, [0; SAMPLES_PER_FRAME]);
+
+        let (_producer, consumer) = rtrb::RingBuffer::new(SAMPLES_PER_FRAME);
+        register_discord_to_sip(channel_id, consumer);
+        frame.fill(456);
+        assert_eq!(get_samples_from_buffer(channel_id, &mut frame), 0);
+        assert_eq!(frame, [0; SAMPLES_PER_FRAME]);
+        unregister_discord_to_sip(channel_id);
+    }
+
+    #[test]
+    fn partial_ring_buffer_frame_is_drained_once_and_zero_padded() {
+        let channel_id = unique_channel_id();
+        let (mut producer, consumer) = rtrb::RingBuffer::new(SAMPLES_PER_FRAME);
+        register_discord_to_sip(channel_id, consumer);
+
+        let samples: Vec<i16> = (0..73).collect();
+        let mut chunk = producer.write_chunk(samples.len()).unwrap();
+        let (first, second) = chunk.as_mut_slices();
+        let first_len = first.len();
+        first.copy_from_slice(&samples[..first_len]);
+        second.copy_from_slice(&samples[first_len..]);
+        chunk.commit_all();
+
+        let mut frame = [-1_i16; SAMPLES_PER_FRAME];
+        assert_eq!(get_samples_from_buffer(channel_id, &mut frame), samples.len());
+        assert_eq!(&frame[..samples.len()], samples.as_slice());
+        assert!(frame[samples.len()..].iter().all(|sample| *sample == 0));
+
+        frame.fill(-1);
+        assert_eq!(get_samples_from_buffer(channel_id, &mut frame), 0);
+        assert_eq!(frame, [0; SAMPLES_PER_FRAME]);
+        unregister_discord_to_sip(channel_id);
+    }
 }

@@ -269,12 +269,34 @@ pub static AUDIO_THREAD_READY: AtomicBool = AtomicBool::new(false);
 /// Uses lock-free SegQueue for zero-contention push/pop on the 50Hz audio thread
 pub static PENDING_CHANNEL_COMPLETIONS: SegQueue<(CallId, ConfPort)> = SegQueue::new();
 
-/// Queue of pending conference connections to be made by the audio thread
-/// Stores (call_id, channel_id) pairs that need their conference connections made
+/// One conference connection attempt owned by the audio thread.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PendingConfConnection {
+    pub call_id: CallId,
+    pub channel_id: Snowflake,
+    pub registration_id: u64,
+    pub attempts: u16,
+    pub not_before_frame: u64,
+}
+
+impl PendingConfConnection {
+    pub fn new(call_id: CallId, channel_id: Snowflake, registration_id: u64) -> Self {
+        Self {
+            call_id,
+            channel_id,
+            registration_id,
+            attempts: 0,
+            not_before_frame: 0,
+        }
+    }
+}
+
+/// Queue of pending conference connections to be made by the audio thread.
+/// Entries carry retry state so transient PJSUA failures cannot silently strand a call.
 /// This is used because pjsua_conf_connect conflicts with the audio thread's
 /// pjmedia_port_get_frame calls if made from a different thread
 /// Uses lock-free SegQueue for zero-contention push/pop on the 50Hz audio thread
-pub static PENDING_CONF_CONNECTIONS: SegQueue<(CallId, Snowflake)> = SegQueue::new();
+pub static PENDING_CONF_CONNECTIONS: SegQueue<PendingConfConnection> = SegQueue::new();
 
 /// Pending PJSUA operations that must be executed by the audio thread
 /// These operations modify the conference bridge and must be synchronized with get_frame
@@ -339,6 +361,10 @@ pub static CALL_CONF_PORTS: OnceLock<DashMap<CallId, ConfPort>> = OnceLock::new(
 /// call_id -> channel_id mapping (which Discord channel each call belongs to)
 /// Using DashMap for lock-free concurrent access on audio hot path
 pub static CALL_CHANNELS: OnceLock<DashMap<CallId, Snowflake>> = OnceLock::new();
+
+/// Generation of each call -> channel registration. Numeric PJSUA call IDs are
+/// reused, so queued conference work must also match this generation.
+pub static CALL_CHANNEL_REGISTRATIONS: OnceLock<DashMap<CallId, u64>> = OnceLock::new();
 
 /// channel_id -> set of call_ids (all calls in each channel)
 /// Uses RwLock: audio thread takes .read() (non-exclusive, 50Hz), call lifecycle takes .write()

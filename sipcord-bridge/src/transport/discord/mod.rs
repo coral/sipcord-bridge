@@ -88,7 +88,7 @@ pub fn unregister_discord_to_sip_producer(channel_id: Snowflake) {
 /// Write resampled audio directly to the Discord→SIP ring buffer.
 /// Called from VoiceReceiver on the Songbird event loop.
 /// Returns true if audio was written, false if no producer registered or buffer full.
-fn write_discord_to_sip(channel_id: Snowflake, samples_16k: &[i16]) -> bool {
+pub(crate) fn write_discord_to_sip(channel_id: Snowflake, samples_16k: &[i16]) -> bool {
     let Some(producer_entry) = get_discord_to_sip_producers().get(&channel_id) else {
         return false;
     };
