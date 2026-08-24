@@ -34,9 +34,9 @@ These instructions were written by Claude. They might be wrong. Remember — no 
 
 Use this URL format, replacing `YOUR_CLIENT_ID`:
 ```
-https://discord.com/oauth2/authorize?client_id=YOUR_CLIENT_ID&scope=bot&permissions=36700160
+https://discord.com/oauth2/authorize?client_id=YOUR_CLIENT_ID&scope=bot&permissions=36701184
 ```
-The bot needs Connect + Speak permissions in voice channels.
+The bot needs View Channel + Connect + Speak permissions in voice channels.
 
 ### 2. Get Discord channel IDs
 
