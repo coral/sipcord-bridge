@@ -100,8 +100,13 @@ You should see it load the dialplan and start listening.
 Requires Rust nightly (for `portable_simd`) and system dependencies for pjproject (OpenSSL, Opus, libtiff, etc). See the `Dockerfile` for the full list.
 
 ```bash
+git clone https://github.com/coral/sipcord-bridge.git
+cd sipcord-bridge
+git submodule update --init --recursive
 cargo run --release -p sipcord-bridge
 ```
+
+If you already cloned the repository, run `git submodule update --init --recursive` from its root before building.
 
 The binary reads `config.toml` from the working directory (or `CONFIG_PATH`), the dialplan from `./dialplan.toml` (or `DIALPLAN_PATH`), and sound files from `./wav/` (or `SOUNDS_DIR`).
 
