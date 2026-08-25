@@ -13,6 +13,9 @@ permissions:
   contents: read
   packages: write
 
+env:
+  IMAGE_PREFIX: ghcr.io/coral/sipcord
+
 jobs:
   ci:
     runs-on: ubuntu-latest
@@ -37,18 +40,13 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Derive lowercase image metadata
-        run: |
-          REPO_URI_LOWERCASE=$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')
-          echo "IMAGE_PREFIX_LOWERCASE=ghcr.io/$REPO_URI_LOWERCASE" >> $GITHUB_ENV
-
       - name: Build and push
         uses: docker/build-push-action@v4
         with:
           platforms: linux/amd64,linux/arm64
           push: ${{ github.event_name == 'push' }}
           tags: |
-            ${{ env.IMAGE_PREFIX_LOWERCASE }}:latest
-            ${{ env.IMAGE_PREFIX_LOWERCASE }}:${{ github.sha }}
+            ${{ env.IMAGE_PREFIX }}:latest
+            ${{ env.IMAGE_PREFIX }}:${{ github.sha }}
           labels: |
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
