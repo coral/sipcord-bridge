@@ -77,6 +77,10 @@ services:
     image: ghcr.io/coral/sipcord-bridge:latest
     container_name: sipcord-bridge
     restart: always
+    ulimits:
+      nofile:
+        soft: 4096
+        hard: 4096
     network_mode: host
     env_file:
       - .env

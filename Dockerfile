@@ -23,6 +23,7 @@ FROM build-base AS pjproject-builder
 WORKDIR /build
 
 COPY pjsua/pjproject/ pjproject-src/
+COPY pjsua/pjproject_config.h pjproject_config.h
 
 RUN mkdir -p pjproject-build pjproject-install && \
     cd pjproject-build && \
@@ -41,8 +42,8 @@ RUN mkdir -p pjproject-build pjproject-install && \
         -DPJMEDIA_WITH_OPENCORE_AMRWB_CODEC=ON \
         -DPJMEDIA_WITH_OPUS_CODEC=ON \
         -DPJLIB_WITH_SSL=openssl \
-        "-DCMAKE_C_FLAGS=-DPJSUA_MAX_CALLS=128" \
-        "-DCMAKE_CXX_FLAGS=-DPJSUA_MAX_CALLS=128" \
+        "-DCMAKE_C_FLAGS=-include /build/pjproject_config.h" \
+        "-DCMAKE_CXX_FLAGS=-include /build/pjproject_config.h" \
         ../pjproject-src && \
     cmake --build . -j$(nproc) \
         --target pjlib pjlib-util pjnath pjmedia pjmedia-audiodev \

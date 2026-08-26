@@ -381,8 +381,8 @@ pub fn init_pjsua(
         let cfg_ptr = cfg.assume_init_mut();
 
         // Allow enough concurrent call slots for real calls + spam that's being rejected.
-        // Compile-time PJSUA_MAX_CALLS is set to 128 in config_site.h.
-        cfg_ptr.max_calls = 128;
+        // This is derived from SIPCORD_MAX_CLIENTS in pjproject_config.h.
+        cfg_ptr.max_calls = PJSUA_MAX_CALLS as _;
 
         // Set callbacks
         cfg_ptr.cb.on_incoming_call = Some(on_incoming_call_cb);

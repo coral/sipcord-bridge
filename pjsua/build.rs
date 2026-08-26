@@ -15,6 +15,8 @@ fn main() {
     println!("cargo:rerun-if-env-changed=PJPROJECT_DIR");
 
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
+    let pjproject_config = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("pjproject_config.h");
+    println!("cargo:rerun-if-changed={}", pjproject_config.display());
 
     // If PJPROJECT_DIR is set, use pre-built pjproject (e.g. from a separate Docker stage).
     // Otherwise build from source via cmake.
@@ -67,7 +69,7 @@ fn main() {
         }
         include_dirs
     } else {
-        build_from_source(&out_dir)
+        build_from_source(&out_dir, &pjproject_config)
     };
 
     // ---- System libraries (common to both paths) ----
@@ -179,6 +181,8 @@ fn main() {
     clang_args.push("-DPJ_HAS_INT64=1".to_string());
 
     clang_args.push("-DPJ_AUTOCONF=1".to_string());
+    clang_args.push("-include".to_string());
+    clang_args.push(pjproject_config.display().to_string());
 
     let pjsua_header = include_paths
         .iter()
@@ -188,11 +192,7 @@ fn main() {
                 return Some(header);
             }
             let header = p.join("pjsua.h");
-            if header.exists() {
-                Some(header)
-            } else {
-                None
-            }
+            if header.exists() { Some(header) } else { None }
         })
         .expect("Could not find pjsua.h header in installed location");
 
@@ -227,7 +227,7 @@ fn main() {
 }
 
 /// Build pjproject from source and return include paths.
-fn build_from_source(out_dir: &Path) -> Vec<PathBuf> {
+fn build_from_source(out_dir: &Path, pjproject_config: &Path) -> Vec<PathBuf> {
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
     let pjproject_src = manifest_dir.join("pjproject");
 
@@ -240,7 +240,12 @@ fn build_from_source(out_dir: &Path) -> Vec<PathBuf> {
     let include_dir = pjproject_install.join("include");
     let lib_dir = pjproject_install.join("lib");
 
-    build_pjproject(&pjproject_src, &pjproject_build, &pjproject_install);
+    build_pjproject(
+        &pjproject_src,
+        &pjproject_build,
+        &pjproject_install,
+        pjproject_config,
+    );
 
     let include_paths = vec![include_dir.clone()];
     let lib_paths = vec![lib_dir.clone()];
@@ -329,6 +334,7 @@ fn build_pjproject(
     pjproject_src: &std::path::Path,
     pjproject_build: &std::path::Path,
     pjproject_install: &std::path::Path,
+    pjproject_config: &std::path::Path,
 ) {
     // Check for .pc file in build dir (CMake install doesn't always copy it to install dir)
     let pc_file = pjproject_build.join("libpjproject.pc");
@@ -341,9 +347,12 @@ fn build_pjproject(
         let host = env::var("HOST").unwrap_or_default();
         let is_cross = target != host;
 
-        // Collect C/CXX flags — merged at the end into CMAKE_C_FLAGS/CMAKE_CXX_FLAGS.
-        // pjsua.h guards PJSUA_MAX_CALLS with #ifndef, so -D on the command line wins.
-        let mut c_flags: Vec<&str> = vec!["-DPJSUA_MAX_CALLS=128"];
+        // Force-include the same tracked capacity configuration used by bindgen
+        // and the Docker pjproject build.
+        let mut c_flags = vec![
+            "-include".to_string(),
+            pjproject_config.display().to_string(),
+        ];
 
         let mut cmake_args = vec![
             "-G".to_string(),
@@ -398,8 +407,8 @@ fn build_pjproject(
                     // 1. -mno-outline-atomics: Use inline atomics instead of helper functions
                     // 2. -DPJ_POOL_ALIGNMENT=8: Force pjlib pool to use 8-byte alignment (C define)
                     if target.contains("aarch64") {
-                        c_flags.push("-mno-outline-atomics");
-                        c_flags.push("-DPJ_POOL_ALIGNMENT=8");
+                        c_flags.push("-mno-outline-atomics".to_string());
+                        c_flags.push("-DPJ_POOL_ALIGNMENT=8".to_string());
                         println!(
                             "cargo:warning=ARM64: Using inline atomics with 8-byte pool alignment"
                         );
