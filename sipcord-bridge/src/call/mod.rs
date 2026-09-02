@@ -14,7 +14,7 @@
 //! 7. When caller hangs up, remove from bridge
 //! 8. When last caller leaves, destroy the bridge (disconnect bot)
 
-use crate::fax::session::FaxSession;
+use crate::fax::session::{FaxSession, FaxSource};
 use crate::fax::spandsp::FaxT38Receiver;
 use crate::routing::{
     Backend, CallError, CallStartedInfo, OutboundCallCommand, OutboundCallFailureReason,
@@ -45,11 +45,19 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, trace, warn};
 use udptl::AsyncUdptlSocket;
 
-/// Type alias for fax session entries stored in the DashMap.
-type FaxSessionEntry = (Arc<tokio::sync::Mutex<FaxSession>>, CancellationToken);
-
 type CallInstanceId = u64;
 static NEXT_CALL_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
+
+/// Fax state associated with one specific incarnation of a PJSUA call ID.
+///
+/// PJSUA reuses numeric call IDs. Keeping the instance ID here lets delayed
+/// routing work avoid removing or switching a newer fax session that happens
+/// to have the same numeric call ID.
+struct FaxSessionEntry {
+    session: Arc<tokio::sync::Mutex<FaxSession>>,
+    cancel_token: CancellationToken,
+    instance_id: CallInstanceId,
+}
 
 fn next_call_instance_id() -> CallInstanceId {
     NEXT_CALL_INSTANCE_ID.fetch_add(1, Ordering::Relaxed)
@@ -75,6 +83,95 @@ fn remove_call_if_current(
     match sip_calls.entry(call_id) {
         Entry::Occupied(entry) if entry.get().instance_id == instance_id => Some(entry.remove()),
         _ => None,
+    }
+}
+
+fn fax_session_is_current(
+    sip_calls: &DashMap<CallId, SipCallInfo>,
+    fax_sessions: &DashMap<CallId, FaxSessionEntry>,
+    call_id: CallId,
+    instance_id: CallInstanceId,
+    expected_session: &Arc<tokio::sync::Mutex<FaxSession>>,
+) -> bool {
+    call_is_current(sip_calls, call_id, instance_id)
+        && fax_sessions.get(&call_id).is_some_and(|entry| {
+            entry.instance_id == instance_id && Arc::ptr_eq(&entry.session, expected_session)
+        })
+}
+
+fn register_fax_session_if_current(
+    sip_calls: &DashMap<CallId, SipCallInfo>,
+    fax_sessions: &DashMap<CallId, FaxSessionEntry>,
+    call_id: CallId,
+    instance_id: CallInstanceId,
+    session: Arc<tokio::sync::Mutex<FaxSession>>,
+    cancel_token: CancellationToken,
+) -> bool {
+    use dashmap::mapref::entry::Entry;
+
+    match fax_sessions.entry(call_id) {
+        Entry::Vacant(entry) => {
+            if !call_is_current(sip_calls, call_id, instance_id) {
+                return false;
+            }
+            entry.insert(FaxSessionEntry {
+                session,
+                cancel_token,
+                instance_id,
+            });
+            true
+        }
+        Entry::Occupied(mut entry) => {
+            if !call_is_current(sip_calls, call_id, instance_id) {
+                return false;
+            }
+
+            // A second task for the same call incarnation must not replace the
+            // session already visible to the SIP event handler.
+            if entry.get().instance_id == instance_id {
+                return Arc::ptr_eq(&entry.get().session, &session);
+            }
+
+            let previous_instance_id = entry.get().instance_id;
+            entry.get().cancel_token.cancel();
+            crate::fax::audio_port::remove_fax_audio_port(call_id);
+            entry.insert(FaxSessionEntry {
+                session,
+                cancel_token,
+                instance_id,
+            });
+            warn!(
+                "Replaced stale fax session for reused call ID {} (old instance {}, new instance {})",
+                call_id, previous_instance_id, instance_id
+            );
+            true
+        }
+    }
+}
+
+/// Remove a fax session only if it is still the exact session registered by
+/// the caller. Cancellation and audio-port teardown happen while the DashMap
+/// entry is occupied so a reused call ID cannot install a new session between
+/// the identity check and teardown.
+fn remove_fax_session_if_current(
+    fax_sessions: &DashMap<CallId, FaxSessionEntry>,
+    call_id: CallId,
+    instance_id: CallInstanceId,
+    expected_session: &Arc<tokio::sync::Mutex<FaxSession>>,
+) -> bool {
+    use dashmap::mapref::entry::Entry;
+
+    match fax_sessions.entry(call_id) {
+        Entry::Occupied(entry)
+            if entry.get().instance_id == instance_id
+                && Arc::ptr_eq(&entry.get().session, expected_session) =>
+        {
+            entry.get().cancel_token.cancel();
+            crate::fax::audio_port::remove_fax_audio_port(call_id);
+            entry.remove();
+            true
+        }
+        _ => false,
     }
 }
 
@@ -765,6 +862,103 @@ mod outbound_failure_tests {
             1
         ));
     }
+
+    fn delivered(batch: &SequencedIfpBatch<'_>) -> Vec<(u16, u8, bool)> {
+        batch
+            .packets
+            .iter()
+            .map(|packet| (packet.seq_number, packet.data[0], packet.recovered))
+            .collect()
+    }
+
+    #[test]
+    fn t38_first_packet_replays_retained_redundancy_oldest_first() {
+        let mut sequencer = T38IfpSequencer::default();
+        let redundant = vec![vec![9], vec![8]]; // Newest first: seq 9, then seq 8.
+        let batch = sequencer.accept(10, &[10], &redundant);
+
+        assert_eq!(
+            delivered(&batch),
+            vec![(8, 8, true), (9, 9, true), (10, 10, false)]
+        );
+        assert_eq!(batch.unrecovered_packets, 0);
+        assert!(!batch.stale);
+    }
+
+    #[test]
+    fn t38_in_order_packet_does_not_replay_redundancy() {
+        let mut sequencer = T38IfpSequencer::default();
+        let first = sequencer.accept(10, &[10], &[]);
+        assert_eq!(delivered(&first), vec![(10, 10, false)]);
+
+        let redundant = vec![vec![10], vec![9]];
+        let second = sequencer.accept(11, &[11], &redundant);
+        assert_eq!(delivered(&second), vec![(11, 11, false)]);
+        assert_eq!(second.unrecovered_packets, 0);
+    }
+
+    #[test]
+    fn t38_gap_is_recovered_oldest_first_before_primary() {
+        let mut sequencer = T38IfpSequencer::default();
+        sequencer.accept(10, &[10], &[]);
+
+        let redundant = vec![vec![13], vec![12], vec![11]];
+        let batch = sequencer.accept(14, &[14], &redundant);
+        assert_eq!(
+            delivered(&batch),
+            vec![
+                (11, 11, true),
+                (12, 12, true),
+                (13, 13, true),
+                (14, 14, false),
+            ]
+        );
+        assert_eq!(batch.unrecovered_packets, 0);
+    }
+
+    #[test]
+    fn t38_partial_redundancy_reports_packets_it_cannot_recover() {
+        let mut sequencer = T38IfpSequencer::default();
+        sequencer.accept(9, &[9], &[]);
+
+        let redundant = vec![vec![13], vec![12]];
+        let batch = sequencer.accept(14, &[14], &redundant);
+        assert_eq!(
+            delivered(&batch),
+            vec![(12, 12, true), (13, 13, true), (14, 14, false)]
+        );
+        assert_eq!(batch.unrecovered_packets, 2); // seq 10 and 11
+    }
+
+    #[test]
+    fn t38_stale_and_duplicate_packets_are_ignored_without_rewinding() {
+        let mut sequencer = T38IfpSequencer::default();
+        sequencer.accept(10, &[10], &[]);
+
+        for stale_seq in [10, 9] {
+            let batch = sequencer.accept(stale_seq, &[99], &[]);
+            assert!(batch.stale);
+            assert!(batch.packets.is_empty());
+        }
+
+        let next = sequencer.accept(11, &[11], &[]);
+        assert_eq!(delivered(&next), vec![(11, 11, false)]);
+    }
+
+    #[test]
+    fn t38_recovery_handles_sequence_number_rollover() {
+        let mut sequencer = T38IfpSequencer::default();
+        sequencer.accept(u16::MAX - 1, &[254], &[]);
+
+        // Primary seq 1 retains seq 0 first and seq 65535 second.
+        let redundant = vec![vec![0], vec![255]];
+        let batch = sequencer.accept(1, &[1], &redundant);
+        assert_eq!(
+            delivered(&batch),
+            vec![(u16::MAX, 255, true), (0, 0, true), (1, 1, false)]
+        );
+        assert_eq!(batch.unrecovered_packets, 0);
+    }
 }
 
 /// Ring buffer capacity for Discord→SIP audio (i16 mono @ 16kHz).
@@ -1016,9 +1210,12 @@ impl BridgeCoordinator {
 
                         // Check if this was a fax call — clean up fax session
                         // Fax calls skip on_call_ended (no "hung up" notification)
-                        if let Some((_, (fax_session, cancel_token))) =
-                            ctx.fax_sessions.remove(&call_id)
-                        {
+                        if let Some((_, fax_entry)) = ctx.fax_sessions.remove(&call_id) {
+                            let FaxSessionEntry {
+                                session: fax_session,
+                                cancel_token,
+                                ..
+                            } = fax_entry;
                             // Cancel the T.38 processing task (if running) before locking
                             cancel_token.cancel();
 
@@ -1234,10 +1431,13 @@ impl BridgeCoordinator {
                         );
 
                         // Check if this call has a fax session
-                        if let Some(entry) = ctx.fax_sessions.get(&call_id) {
-                            let (fax_session, cancel_token) = entry.value();
-                            let fax_session = fax_session.clone();
-                            let cancel_token = cancel_token.clone();
+                        if let Some(entry) = ctx.fax_sessions.get(&call_id)
+                            && sip_calls.get(&call_id).is_some_and(|call| {
+                                call.instance_id == entry.instance_id
+                            })
+                        {
+                            let fax_session = entry.session.clone();
+                            let cancel_token = entry.cancel_token.clone();
                             let sip_cmd_tx = sip_cmd_tx.clone();
 
                             tokio::spawn(async move {
@@ -1867,7 +2067,7 @@ async fn handle_incoming_call(
             // Fax calls: answer the SIP call but DON'T connect to Discord voice.
             // Instead, create a FaxSession that will receive audio and post to Discord text channel.
 
-            let mut fax_session = match FaxSession::new(
+            let fax_session = match FaxSession::new(
                 call_id,
                 text_channel_id,
                 guild_id,
@@ -1883,38 +2083,136 @@ async fn handle_incoming_call(
                 }
             };
 
-            // Answer the call to establish audio path
-            let _ = sip_cmd_tx.send(SipCommand::Answer { call_id });
+            // Register the session before answering. Some gateways send their
+            // T.38 re-INVITE immediately after the 200 OK; registering later
+            // made that valid offer look unrelated to a fax call.
+            let fax_session = Arc::new(tokio::sync::Mutex::new(fax_session));
+            let cancel_token = CancellationToken::new();
+
+            if !call_is_current(&sip_calls, call_id, instance_id) {
+                return;
+            }
+
+            if !register_fax_session_if_current(
+                &sip_calls,
+                &fax_sessions,
+                call_id,
+                instance_id,
+                fax_session.clone(),
+                cancel_token.clone(),
+            ) {
+                return;
+            }
+
+            if !fax_session_is_current(
+                &sip_calls,
+                &fax_sessions,
+                call_id,
+                instance_id,
+                &fax_session,
+            ) {
+                remove_fax_session_if_current(
+                    &fax_sessions,
+                    call_id,
+                    instance_id,
+                    &fax_session,
+                );
+                return;
+            }
+
+            // Answer the call to establish the audio path. The session is
+            // already discoverable if the answer triggers a fast re-INVITE.
+            if sip_cmd_tx.send(SipCommand::Answer { call_id }).is_err() {
+                error!("Failed to queue Answer for fax call {}", call_id);
+                remove_fax_session_if_current(
+                    &fax_sessions,
+                    call_id,
+                    instance_id,
+                    &fax_session,
+                );
+                remove_call_if_current(&sip_calls, call_id, instance_id);
+                return;
+            }
 
             // Post "Receiving fax..." message to Discord
-            if let Err(e) = fax_session.post_receiving_message().await {
+            let post_result = {
+                let mut session = fax_session.lock().await;
+                session.post_receiving_message().await
+            };
+            if let Err(e) = post_result {
                 error!("Failed to post fax receiving message: {}", e);
                 if call_is_current(&sip_calls, call_id, instance_id) {
                     let _ = sip_cmd_tx.send(SipCommand::Hangup { call_id });
                     remove_call_if_current(&sip_calls, call_id, instance_id);
                 }
+                remove_fax_session_if_current(
+                    &fax_sessions,
+                    call_id,
+                    instance_id,
+                    &fax_session,
+                );
                 return;
             }
 
-            if !call_is_current(&sip_calls, call_id, instance_id) {
+            if !fax_session_is_current(
+                &sip_calls,
+                &fax_sessions,
+                call_id,
+                instance_id,
+                &fax_session,
+            ) {
+                remove_fax_session_if_current(
+                    &fax_sessions,
+                    call_id,
+                    instance_id,
+                    &fax_session,
+                );
                 return;
             }
-
-            // Store fax session with cancellation token for T.38 task shutdown
-            let fax_session = Arc::new(tokio::sync::Mutex::new(fax_session));
-            let cancel_token = CancellationToken::new();
-            fax_sessions.insert(call_id, (fax_session.clone(), cancel_token));
 
             // Wait briefly for PJSUA to establish media (conf_port assignment)
             tokio::time::sleep(Duration::from_millis(500)).await;
 
-            if !call_is_current(&sip_calls, call_id, instance_id) {
-                fax_sessions.remove(&call_id);
+            if !fax_session_is_current(
+                &sip_calls,
+                &fax_sessions,
+                call_id,
+                instance_id,
+                &fax_session,
+            ) {
+                remove_fax_session_if_current(
+                    &fax_sessions,
+                    call_id,
+                    instance_id,
+                    &fax_session,
+                );
                 return;
             }
 
-            // Create bidirectional fax audio port
-            let audio_ports = crate::fax::audio_port::create_fax_audio_port(call_id).await;
+            // Serialize port creation with switch_to_t38(). Otherwise the T.38
+            // task could remove the slot while its asynchronous conference
+            // connection operation was still queued.
+            let audio_ports = {
+                let session = fax_session.lock().await;
+                if matches!(&session.source, FaxSource::T38Udptl) {
+                    debug!(
+                        "Skipping initial fax audio port for call {} because T.38 is active",
+                        call_id
+                    );
+                    return;
+                }
+                crate::fax::audio_port::create_fax_audio_port(call_id).await
+            };
+            if fax_session_uses_t38(&fax_session).await {
+                // T.38 may have switched while the async port creation was in
+                // flight. Its processing task owns the call now.
+                crate::fax::audio_port::remove_fax_audio_port(call_id);
+                debug!(
+                    "Initial fax audio-port creation for call {} raced T.38; audio task omitted",
+                    call_id
+                );
+                return;
+            }
             if audio_ports.is_none() {
                 warn!(
                     "Could not create fax audio port for call {} — media may not be ready yet. \
@@ -1926,8 +2224,16 @@ async fn handle_incoming_call(
             // Spawn fax audio processing task
             let fax_session_clone = fax_session.clone();
             let sip_cmd_tx_clone = sip_cmd_tx.clone();
+            let audio_cancel_token = cancel_token.clone();
             tokio::spawn(async move {
-                process_fax_audio(call_id, fax_session_clone, audio_ports, sip_cmd_tx_clone).await;
+                process_fax_audio(
+                    call_id,
+                    fax_session_clone,
+                    audio_ports,
+                    audio_cancel_token,
+                    sip_cmd_tx_clone,
+                )
+                .await;
             });
 
             debug!(
@@ -2656,10 +2962,16 @@ async fn poll_recv<T>(rx: &Receiver<T>, name: &str, event_count: &mut u64) -> Op
 /// The timer pacing is critical — SpanDSP's fax_tx() advances its internal clock
 /// by the number of samples generated. Without pacing, TX runs at >100x real-time
 /// and the T.30 state machine expires prematurely.
+async fn fax_session_uses_t38(fax_session: &Arc<tokio::sync::Mutex<FaxSession>>) -> bool {
+    let session = fax_session.lock().await;
+    matches!(&session.source, FaxSource::T38Udptl)
+}
+
 async fn process_fax_audio(
     call_id: CallId,
     fax_session: Arc<tokio::sync::Mutex<FaxSession>>,
     audio_ports: Option<crate::fax::audio_port::FaxAudioPorts>,
+    cancel_token: CancellationToken,
     sip_cmd_tx: Sender<SipCommand>,
 ) {
     use crate::transport::sip::CONF_SAMPLE_RATE;
@@ -2667,6 +2979,20 @@ async fn process_fax_audio(
     let samples_per_frame = (CONF_SAMPLE_RATE * 20 / 1000) as usize; // 320 samples = 20ms
     let mut read_buf = vec![0i16; samples_per_frame];
     let mut tx_buf = vec![0i16; samples_per_frame];
+
+    // A fast T.38 offer can complete while this task is being scheduled.
+    // The T.38 task owns the call from that point; the audio task must exit
+    // without treating the deliberately removed audio port as a call failure.
+    if fax_session_uses_t38(&fax_session).await {
+        if audio_ports.is_some() {
+            crate::fax::audio_port::remove_fax_audio_port(call_id);
+        }
+        debug!(
+            "Fax audio processing not started for call {} because T.38 is active",
+            call_id
+        );
+        return;
+    }
 
     let (mut rx_consumer, mut tx_producer) = match audio_ports {
         Some(ports) => (ports.rx_consumer, ports.tx_producer),
@@ -2676,16 +3002,64 @@ async fn process_fax_audio(
                 "Fax call {} — waiting for audio port to become available...",
                 call_id
             );
-            tokio::time::sleep(Duration::from_secs(2)).await;
+            tokio::select! {
+                _ = cancel_token.cancelled() => return,
+                _ = tokio::time::sleep(Duration::from_secs(2)) => {}
+            }
 
-            match crate::fax::audio_port::create_fax_audio_port(call_id).await {
-                Some(ports) => (ports.rx_consumer, ports.tx_producer),
+            if fax_session_uses_t38(&fax_session).await {
+                debug!(
+                    "Fax audio-port retry skipped for call {} because T.38 is active",
+                    call_id
+                );
+                return;
+            }
+
+            let retry_result = {
+                // Keep switch_to_t38() from removing the conference port
+                // while create_fax_audio_port() is waiting for its queued
+                // connection operation to finish.
+                let session = fax_session.lock().await;
+                if matches!(&session.source, FaxSource::T38Udptl) {
+                    debug!(
+                        "Fax audio-port retry skipped for call {} because T.38 is active",
+                        call_id
+                    );
+                    return;
+                }
+                crate::fax::audio_port::create_fax_audio_port(call_id).await
+            };
+
+            match retry_result {
+                Some(ports) => {
+                    // The switch may have raced the async port creation. In
+                    // that case remove the newly-created, now-unused port and
+                    // leave the healthy T.38 session alone.
+                    if fax_session_uses_t38(&fax_session).await {
+                        crate::fax::audio_port::remove_fax_audio_port(call_id);
+                        debug!(
+                            "Fax audio-port retry for call {} raced T.38; audio task stopped",
+                            call_id
+                        );
+                        return;
+                    }
+                    (ports.rx_consumer, ports.tx_producer)
+                }
                 None => {
+                    // Check and report failure under one lock so a T.38
+                    // switch cannot land between the check and the hangup.
+                    let mut session = fax_session.lock().await;
+                    if matches!(&session.source, FaxSource::T38Udptl) {
+                        debug!(
+                            "Fax audio-port retry for call {} became unnecessary after T.38 switch",
+                            call_id
+                        );
+                        return;
+                    }
                     error!(
                         "Failed to create fax audio port for call {} after retry",
                         call_id
                     );
-                    let mut session = fax_session.lock().await;
                     session
                         .post_failure("Failed to establish audio path for fax reception")
                         .await;
@@ -2709,10 +3083,24 @@ async fn process_fax_audio(
     let mut tick_count: u64 = 0;
 
     loop {
-        interval.tick().await;
+        tokio::select! {
+            _ = cancel_token.cancelled() => {
+                debug!("Fax audio task for call {} cancelled", call_id);
+                return;
+            }
+            _ = interval.tick() => {}
+        }
         tick_count += 1;
 
         let mut session = fax_session.lock().await;
+
+        if matches!(&session.source, FaxSource::T38Udptl) {
+            debug!(
+                "Fax audio processing stopped for call {} after switch to T.38",
+                call_id
+            );
+            return;
+        }
 
         // 1. Drain all available RX audio and feed to SpanDSP
         loop {
@@ -2918,6 +3306,116 @@ async fn handle_t38_switch(
     .await;
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct SequencedIfp<'a> {
+    seq_number: u16,
+    data: &'a [u8],
+    recovered: bool,
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct SequencedIfpBatch<'a> {
+    packets: Vec<SequencedIfp<'a>>,
+    unrecovered_packets: usize,
+    stale: bool,
+}
+
+/// Tracks the next T.38 IFP sequence number expected by SpanDSP.
+///
+/// UDPTL redundancy entries are ordered newest-first: entry zero is sequence
+/// `primary_seq - 1`, entry one is `primary_seq - 2`, and so on. When a primary
+/// packet jumps forward, this sequencer selects only entries from the gap and
+/// returns them oldest-first before the primary. Sequence comparisons use the
+/// usual half-range rule so rollover at 65535 is handled correctly.
+#[derive(Debug, Default)]
+struct T38IfpSequencer {
+    next_seq: Option<u16>,
+}
+
+impl T38IfpSequencer {
+    fn accept<'a>(
+        &mut self,
+        primary_seq: u16,
+        primary_ifp: &'a [u8],
+        redundant_ifps: &'a [Vec<u8>],
+    ) -> SequencedIfpBatch<'a> {
+        let Some(expected_seq) = self.next_seq else {
+            // On the first datagram, retained redundancy may contain the start
+            // of negotiation that was sent before our receive loop began.
+            let mut packets = redundant_ifps
+                .iter()
+                .take(u16::MAX as usize)
+                .enumerate()
+                .rev()
+                .map(|(index, data)| SequencedIfp {
+                    seq_number: primary_seq.wrapping_sub((index + 1) as u16),
+                    data: data.as_slice(),
+                    recovered: true,
+                })
+                .collect::<Vec<_>>();
+            packets.push(SequencedIfp {
+                seq_number: primary_seq,
+                data: primary_ifp,
+                recovered: false,
+            });
+            self.next_seq = Some(primary_seq.wrapping_add(1));
+            return SequencedIfpBatch {
+                packets,
+                ..SequencedIfpBatch::default()
+            };
+        };
+
+        let forward_distance = primary_seq.wrapping_sub(expected_seq);
+        if forward_distance >= 0x8000 {
+            // This packet is behind the already-delivered primary (or exactly
+            // half the sequence space away, which is inherently ambiguous).
+            return SequencedIfpBatch {
+                stale: true,
+                ..SequencedIfpBatch::default()
+            };
+        }
+
+        let mut packets = Vec::new();
+        if forward_distance > 0 {
+            // Reverse newest-first redundancy so recovered IFP packets reach
+            // SpanDSP in ascending sequence order. Filter out entries older
+            // than the first missing packet.
+            packets.extend(
+                redundant_ifps
+                    .iter()
+                    .take(u16::MAX as usize)
+                    .enumerate()
+                    .rev()
+                    .filter_map(|(index, data)| {
+                        let seq_number =
+                            primary_seq.wrapping_sub((index + 1) as u16);
+                        (seq_number.wrapping_sub(expected_seq) < forward_distance).then_some(
+                            SequencedIfp {
+                                seq_number,
+                                data: data.as_slice(),
+                                recovered: true,
+                            },
+                        )
+                    }),
+            );
+        }
+
+        let recovered_packets = packets.len();
+        packets.push(SequencedIfp {
+            seq_number: primary_seq,
+            data: primary_ifp,
+            recovered: false,
+        });
+        self.next_seq = Some(primary_seq.wrapping_add(1));
+
+        SequencedIfpBatch {
+            packets,
+            unrecovered_packets: forward_distance as usize - recovered_packets,
+            stale: false,
+        }
+    }
+}
+
 /// T.38 fax processing task.
 ///
 /// Runs the UDPTL receive loop, timer loop, and TX loop concurrently.
@@ -2961,6 +3459,7 @@ async fn process_fax_t38(
     let udptl_rx = udptl_socket.clone();
     let mut timer_interval = tokio::time::interval(Duration::from_millis(20));
     timer_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut rx_sequencer = T38IfpSequencer::default();
 
     loop {
         tokio::select! {
@@ -2979,12 +3478,46 @@ async fn process_fax_t38(
                             packet.seq_number, call_id, packet.primary_ifp.len(), packet.redundant_ifps().len()
                         );
 
-                        let mut session = fax_session.lock().await;
-
-                        let completed = session.feed_t38_ifp(
-                            &packet.primary_ifp,
+                        let batch = rx_sequencer.accept(
                             packet.seq_number,
+                            &packet.primary_ifp,
+                            packet.redundant_ifps(),
                         );
+                        if batch.stale {
+                            debug!(
+                                "Ignoring stale/duplicate UDPTL packet seq={} for call {}",
+                                packet.seq_number, call_id
+                            );
+                            continue;
+                        }
+                        let recovered_packets = batch
+                            .packets
+                            .iter()
+                            .filter(|packet| packet.recovered)
+                            .count();
+                        if batch.unrecovered_packets > 0 {
+                            warn!(
+                                "UDPTL packet loss for call {} before seq={}: recovered {}, unrecovered {}",
+                                call_id,
+                                packet.seq_number,
+                                recovered_packets,
+                                batch.unrecovered_packets
+                            );
+                        } else if recovered_packets > 0 {
+                            debug!(
+                                "Recovered {} redundant UDPTL packet(s) for call {} before seq={}",
+                                recovered_packets, call_id, packet.seq_number
+                            );
+                        }
+
+                        let mut session = fax_session.lock().await;
+                        let mut completed = false;
+                        for ifp in batch.packets {
+                            completed = session.feed_t38_ifp(ifp.data, ifp.seq_number);
+                            if completed {
+                                break;
+                            }
+                        }
 
                         if completed {
                             debug!("Fax {} T.38 reception complete, converting and posting", call_id);

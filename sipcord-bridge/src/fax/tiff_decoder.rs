@@ -6,7 +6,7 @@
 //! Huffman table data derived from the ITU-T T.4 standard.
 //! Bit-reading approach inspired by the `fax` crate (MIT licensed).
 
-use super::FaxError;
+use super::{FaxError, FaxPageDataError};
 use image::GrayImage;
 use std::path::Path;
 use std::sync::OnceLock;
@@ -23,6 +23,18 @@ macro_rules! tiff_bail {
 /// Maximum TIFF file size (50 MB). Well above any reasonable fax output from SpanDSP,
 /// but prevents OOM from malformed files.
 const MAX_TIFF_SIZE: u64 = 50 * 1024 * 1024;
+
+/// Reject raster fragments that are too short to be a useful fax page.
+///
+/// At common fax resolutions (98 or 196 vertical DPI), 64 rows represent roughly
+/// 0.65 or 0.33 inches respectively. This rejects the handful-of-row slivers produced
+/// by corrupt transfers while retaining unusually short but still usable documents.
+const MIN_DECODED_PAGE_ROWS: u32 = 64;
+
+/// Small row-count differences can be caused by end-of-page marker handling. Permit
+/// eight rows for short pages or 1% for longer pages, whichever is greater.
+const MIN_ALLOWED_ROW_DIFFERENCE: u32 = 8;
+const ALLOWED_ROW_DIFFERENCE_PERCENT: u32 = 1;
 
 /// Decode all pages of a fax TIFF file into grayscale images.
 pub fn decode_fax_tiff(path: &Path) -> Result<Vec<GrayImage>, FaxError> {
@@ -88,6 +100,8 @@ pub fn decode_fax_tiff(path: &Path) -> Result<Vec<GrayImage>, FaxError> {
             other => tiff_bail!("Unsupported TIFF compression: {}", other),
         };
 
+        validate_decoded_page_rows(i + 1, page.height, transitions_per_line.len())?;
+
         let img = assemble_image(
             &transitions_per_line,
             page.width,
@@ -101,6 +115,44 @@ pub fn decode_fax_tiff(path: &Path) -> Result<Vec<GrayImage>, FaxError> {
     }
 
     Ok(images)
+}
+
+/// Ensure a decoded TIFF page is substantial and agrees with its declared height
+/// before allocating an image for it.
+fn validate_decoded_page_rows(
+    page_number: usize,
+    declared_rows: u32,
+    decoded_rows: usize,
+) -> Result<(), FaxError> {
+    let decoded_rows = u32::try_from(decoded_rows).unwrap_or(u32::MAX);
+
+    if decoded_rows < MIN_DECODED_PAGE_ROWS {
+        return Err(FaxError::CorruptPageData(FaxPageDataError::TooShort {
+            page_number,
+            decoded_rows,
+            minimum_rows: MIN_DECODED_PAGE_ROWS,
+        }));
+    }
+
+    let percentage_tolerance = declared_rows
+        .saturating_mul(ALLOWED_ROW_DIFFERENCE_PERCENT)
+        .div_ceil(100);
+    let allowed_difference = MIN_ALLOWED_ROW_DIFFERENCE.max(percentage_tolerance);
+    let difference = declared_rows.abs_diff(decoded_rows);
+
+    if difference > allowed_difference {
+        return Err(FaxError::CorruptPageData(
+            FaxPageDataError::RowCountMismatch {
+                page_number,
+                decoded_rows,
+                declared_rows,
+                difference,
+                allowed_difference,
+            },
+        ));
+    }
+
+    Ok(())
 }
 
 // TIFF IFD Parser
@@ -1281,6 +1333,66 @@ mod tests {
             "Error should mention file not found: {}",
             err
         );
+    }
+
+    #[test]
+    fn decoded_page_rows_rejects_tiny_page_fragments() {
+        let result = validate_decoded_page_rows(2, 4, 4);
+        let err = result.expect_err("four decoded rows must be rejected");
+        assert_eq!(
+            err.to_string(),
+            "Fax received with corrupt/incomplete page data"
+        );
+        let FaxError::CorruptPageData(FaxPageDataError::TooShort {
+            page_number,
+            decoded_rows,
+            minimum_rows,
+        }) = err
+        else {
+            panic!("tiny page must return CorruptPageData");
+        };
+        assert_eq!(page_number, 2);
+        assert_eq!(decoded_rows, 4);
+        assert_eq!(minimum_rows, 64);
+    }
+
+    #[test]
+    fn decoded_page_rows_accepts_minimum_usable_height() {
+        validate_decoded_page_rows(1, MIN_DECODED_PAGE_ROWS, MIN_DECODED_PAGE_ROWS as usize)
+            .expect("a page at the minimum usable height should be accepted");
+    }
+
+    #[test]
+    fn decoded_page_rows_tolerates_small_declared_height_difference() {
+        validate_decoded_page_rows(1, 500, 492)
+            .expect("the eight-row absolute tolerance should be accepted");
+        validate_decoded_page_rows(1, 2_200, 2_178)
+            .expect("a one-percent difference on a full page should be accepted");
+    }
+
+    #[test]
+    fn decoded_page_rows_rejects_significant_declared_height_difference() {
+        let result = validate_decoded_page_rows(1, 2_200, 2_177);
+        let err = result.expect_err("a row difference over one percent must be rejected");
+        assert_eq!(
+            err.to_string(),
+            "Fax received with corrupt/incomplete page data"
+        );
+        let FaxError::CorruptPageData(FaxPageDataError::RowCountMismatch {
+            page_number,
+            decoded_rows,
+            declared_rows,
+            difference,
+            allowed_difference,
+        }) = err
+        else {
+            panic!("row mismatch must return CorruptPageData");
+        };
+        assert_eq!(page_number, 1);
+        assert_eq!(decoded_rows, 2_177);
+        assert_eq!(declared_rows, 2_200);
+        assert_eq!(difference, 23);
+        assert_eq!(allowed_difference, 22);
     }
 
     #[test]

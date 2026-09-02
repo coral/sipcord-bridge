@@ -575,9 +575,7 @@ pub unsafe extern "C" fn on_call_state_cb(raw_call_id: pjsua_call_id, _e: *mut p
                             })
                             .is_err()
                     {
-                        tracing::error!(
-                            "Outbound SIP event queue closed while reporting failure"
-                        );
+                        tracing::error!("Outbound SIP event queue closed while reporting failure");
                     }
                 }
                 // Fall through to normal disconnect handling below —
@@ -932,6 +930,62 @@ pub struct T38OfferParams {
     pub udp_ec: String,
 }
 
+const LOCAL_T38_MAX_VERSION: u8 = 0;
+const LOCAL_T38_MAX_BIT_RATE: u32 = 14_400;
+const T38_BIT_RATES: [u32; 6] = [14_400, 12_000, 9_600, 7_200, 4_800, 2_400];
+const T38_TRANSFERRED_TCF: &str = "transferredTCF";
+const T38_UDP_REDUNDANCY: &str = "t38UDPRedundancy";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct T38AnswerParams {
+    t38_version: u8,
+    max_bit_rate: u32,
+    rate_management: &'static str,
+    udp_ec: &'static str,
+}
+
+/// Select parameters that both the remote offer and the running fax stack can
+/// honor. SpanDSP and the current UDPTL socket are configured for T.38 v0,
+/// transferred TCF, and packet redundancy. Rejecting an unsupported mode is
+/// safer than returning a 200 response that advertises incompatible behavior.
+fn negotiate_t38_answer(offer: &T38OfferParams) -> Result<T38AnswerParams, String> {
+    let offered_rate = offer.max_bit_rate.min(LOCAL_T38_MAX_BIT_RATE);
+    let max_bit_rate = T38_BIT_RATES
+        .into_iter()
+        .find(|rate| *rate <= offered_rate)
+        .ok_or_else(|| {
+            format!(
+                "offered maximum bit rate {} is below the supported T.30 minimum",
+                offer.max_bit_rate
+            )
+        })?;
+
+    if !offer
+        .rate_management
+        .trim()
+        .eq_ignore_ascii_case(T38_TRANSFERRED_TCF)
+    {
+        return Err(format!(
+            "unsupported rate management {}",
+            offer.rate_management
+        ));
+    }
+
+    if !offer.udp_ec.trim().eq_ignore_ascii_case(T38_UDP_REDUNDANCY) {
+        return Err(format!(
+            "unsupported UDPTL error correction {}",
+            offer.udp_ec
+        ));
+    }
+
+    Ok(T38AnswerParams {
+        t38_version: offer.t38_version.min(LOCAL_T38_MAX_VERSION),
+        max_bit_rate,
+        rate_management: T38_TRANSFERRED_TCF,
+        udp_ec: T38_UDP_REDUNDANCY,
+    })
+}
+
 /// Check if an SDP offer contains a T.38 media line (`m=image ... udptl t38`).
 unsafe fn sdp_has_t38(offer: *const pjmedia_sdp_session) -> Option<T38OfferParams> {
     if offer.is_null() {
@@ -988,20 +1042,14 @@ unsafe fn sdp_has_t38(offer: *const pjmedia_sdp_session) -> Option<T38OfferParam
                 let name = pj_str_to_string(&(*attr).name);
                 let value = pj_str_to_string(&(*attr).value);
 
-                match name.as_str() {
-                    "T38FaxVersion" => {
-                        t38_version = value.parse().unwrap_or(0);
-                    }
-                    "T38MaxBitRate" => {
-                        max_bit_rate = value.parse().unwrap_or(14400);
-                    }
-                    "T38FaxRateManagement" => {
-                        rate_management = value;
-                    }
-                    "T38FaxUdpEC" => {
-                        udp_ec = value;
-                    }
-                    _ => {}
+                if name.eq_ignore_ascii_case("T38FaxVersion") {
+                    t38_version = value.parse().unwrap_or(0);
+                } else if name.eq_ignore_ascii_case("T38MaxBitRate") {
+                    max_bit_rate = value.parse().unwrap_or(0);
+                } else if name.eq_ignore_ascii_case("T38FaxRateManagement") {
+                    rate_management = value;
+                } else if name.eq_ignore_ascii_case("T38FaxUdpEC") {
+                    udp_ec = value;
                 }
             }
 
@@ -1056,6 +1104,21 @@ pub unsafe extern "C" fn on_call_rx_reinvite_cb(
                 t38_params.max_bit_rate,
                 t38_params.udp_ec
             );
+
+            let t38_answer = match negotiate_t38_answer(&t38_params) {
+                Ok(answer) => answer,
+                Err(reason) => {
+                    tracing::warn!(
+                        "Call {} rejecting incompatible T.38 offer: {}",
+                        call_id,
+                        reason
+                    );
+                    if !code.is_null() {
+                        *code = 488;
+                    }
+                    return;
+                }
+            };
 
             // Handle T.38 re-INVITE by sending 200 OK at the dialog level,
             // completely bypassing pjsip's inv session and pjsua's media handling.
@@ -1154,13 +1217,21 @@ pub unsafe extern "C" fn on_call_rx_reinvite_cb(
              c=IN IP4 {}\r\n\
              t=0 0\r\n\
              m=image {} udptl t38\r\n\
-             a=T38FaxVersion:0\r\n\
-             a=T38MaxBitRate:14400\r\n\
-             a=T38FaxRateManagement:transferredTCF\r\n\
+             a=T38FaxVersion:{}\r\n\
+             a=T38MaxBitRate:{}\r\n\
+             a=T38FaxRateManagement:{}\r\n\
              a=T38FaxMaxBuffer:260\r\n\
              a=T38FaxMaxDatagram:316\r\n\
-             a=T38FaxUdpEC:t38UDPRedundancy\r\n",
-                sess_id, sess_id, local_ip, local_ip, local_port
+             a=T38FaxUdpEC:{}\r\n",
+                sess_id,
+                sess_id,
+                local_ip,
+                local_ip,
+                local_port,
+                t38_answer.t38_version,
+                t38_answer.max_bit_rate,
+                t38_answer.rate_management,
+                t38_answer.udp_ec
             );
 
             let pool = pjsua_pool_create(c"t38sdp".as_ptr(), 1024, 256);
@@ -1253,10 +1324,14 @@ pub unsafe extern "C" fn on_call_rx_reinvite_cb(
             }
 
             tracing::info!(
-                "Sent T.38 200 OK for call {} (local={}:{}) via dialog",
+                "Sent T.38 200 OK for call {} (local={}:{}, version={}, rate={}bps, mgmt={}, ec={}) via dialog",
                 call_id,
                 local_ip,
-                local_port
+                local_port,
+                t38_answer.t38_version,
+                t38_answer.max_bit_rate,
+                t38_answer.rate_management,
+                t38_answer.udp_ec
             );
 
             // 8. Store pre-bound socket for async UDPTL handler
@@ -1269,10 +1344,10 @@ pub unsafe extern "C" fn on_call_rx_reinvite_cb(
                         call_id,
                         remote_ip: t38_params.remote_ip,
                         remote_port: t38_params.remote_port,
-                        t38_version: t38_params.t38_version,
-                        max_bit_rate: t38_params.max_bit_rate,
-                        rate_management: t38_params.rate_management,
-                        udp_ec: t38_params.udp_ec,
+                        t38_version: t38_answer.t38_version,
+                        max_bit_rate: t38_answer.max_bit_rate,
+                        rate_management: t38_answer.rate_management.to_string(),
+                        udp_ec: t38_answer.udp_ec.to_string(),
                         local_port,
                     })
                     .is_err()
@@ -1389,5 +1464,95 @@ unsafe fn strip_hold_from_neg_remote(call_id: CallId, rdata: *mut pjsip_rx_data)
         }
 
         stripped_any
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn t38_offer(
+        version: u8,
+        max_bit_rate: u32,
+        rate_management: &str,
+        udp_ec: &str,
+    ) -> T38OfferParams {
+        T38OfferParams {
+            remote_ip: "192.0.2.10".to_string(),
+            remote_port: 4000,
+            t38_version: version,
+            max_bit_rate,
+            rate_management: rate_management.to_string(),
+            udp_ec: udp_ec.to_string(),
+        }
+    }
+
+    #[test]
+    fn t38_answer_clamps_version_and_bit_rate_to_local_capabilities() {
+        let offer = t38_offer(3, 33_600, T38_TRANSFERRED_TCF, T38_UDP_REDUNDANCY);
+
+        assert_eq!(
+            negotiate_t38_answer(&offer),
+            Ok(T38AnswerParams {
+                t38_version: 0,
+                max_bit_rate: 14_400,
+                rate_management: T38_TRANSFERRED_TCF,
+                udp_ec: T38_UDP_REDUNDANCY,
+            })
+        );
+    }
+
+    #[test]
+    fn t38_answer_honors_lower_remote_bit_rate() {
+        let offer = t38_offer(0, 9_600, T38_TRANSFERRED_TCF, T38_UDP_REDUNDANCY);
+
+        assert_eq!(
+            negotiate_t38_answer(&offer)
+                .expect("compatible offer")
+                .max_bit_rate,
+            9_600
+        );
+    }
+
+    #[test]
+    fn t38_answer_rounds_nonstandard_limit_down() {
+        let offer = t38_offer(0, 10_000, T38_TRANSFERRED_TCF, T38_UDP_REDUNDANCY);
+
+        assert_eq!(
+            negotiate_t38_answer(&offer)
+                .expect("compatible offer")
+                .max_bit_rate,
+            9_600
+        );
+    }
+
+    #[test]
+    fn t38_answer_normalizes_case_for_supported_tokens() {
+        let offer = t38_offer(0, 14_400, "TransferredTcf", "T38UdpRedundancy");
+        let answer = negotiate_t38_answer(&offer).expect("compatible offer");
+
+        assert_eq!(answer.rate_management, T38_TRANSFERRED_TCF);
+        assert_eq!(answer.udp_ec, T38_UDP_REDUNDANCY);
+    }
+
+    #[test]
+    fn t38_answer_rejects_unsupported_rate_management() {
+        let offer = t38_offer(0, 14_400, "localTCF", T38_UDP_REDUNDANCY);
+
+        assert!(negotiate_t38_answer(&offer).is_err());
+    }
+
+    #[test]
+    fn t38_answer_rejects_unsupported_error_correction() {
+        let offer = t38_offer(0, 14_400, T38_TRANSFERRED_TCF, "t38UDPFEC");
+
+        assert!(negotiate_t38_answer(&offer).is_err());
+    }
+
+    #[test]
+    fn t38_answer_rejects_bit_rate_below_t30_minimum() {
+        let offer = t38_offer(0, 1_200, T38_TRANSFERRED_TCF, T38_UDP_REDUNDANCY);
+
+        assert!(negotiate_t38_answer(&offer).is_err());
     }
 }

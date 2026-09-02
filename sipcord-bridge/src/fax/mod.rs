@@ -18,6 +18,28 @@ pub mod spandsp;
 pub mod tiff_decoder;
 
 #[derive(thiserror::Error, Debug)]
+pub enum FaxPageDataError {
+    #[error("TIFF page {page_number} decoded only {decoded_rows} rows (minimum {minimum_rows})")]
+    TooShort {
+        page_number: usize,
+        decoded_rows: u32,
+        minimum_rows: u32,
+    },
+
+    #[error(
+        "TIFF page {page_number} decoded {decoded_rows} rows, but TIFF declares {declared_rows} \
+         (difference {difference}, allowed {allowed_difference})"
+    )]
+    RowCountMismatch {
+        page_number: usize,
+        decoded_rows: u32,
+        declared_rows: u32,
+        difference: u32,
+        allowed_difference: u32,
+    },
+}
+
+#[derive(thiserror::Error, Debug)]
 pub enum FaxError {
     #[error("Discord post failed: {0}")]
     Discord(#[from] serenity::Error),
@@ -44,6 +66,35 @@ pub enum FaxError {
     #[error("TIFF decode: {0}")]
     Tiff(String),
 
+    #[error("Fax received with corrupt/incomplete page data")]
+    CorruptPageData(#[source] FaxPageDataError),
+
     #[error("no pages in received fax")]
     NoPages,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn corrupt_page_error_has_stable_user_message_and_diagnostic_detail() {
+        let error = FaxError::CorruptPageData(FaxPageDataError::TooShort {
+            page_number: 2,
+            decoded_rows: 4,
+            minimum_rows: 64,
+        });
+
+        assert_eq!(
+            error.to_string(),
+            "Fax received with corrupt/incomplete page data"
+        );
+        let FaxError::CorruptPageData(source) = error else {
+            panic!("expected corrupt page data error");
+        };
+        assert_eq!(
+            source.to_string(),
+            "TIFF page 2 decoded only 4 rows (minimum 64)"
+        );
+    }
 }

@@ -18,19 +18,42 @@ const T4_COMPRESSION_T4_1D: i32 = spandsp_sys::t4_image_compression_t_T4_COMPRES
 const T4_COMPRESSION_T4_2D: i32 = spandsp_sys::t4_image_compression_t_T4_COMPRESSION_T4_2D as i32;
 const T4_COMPRESSION_T6: i32 = spandsp_sys::t4_image_compression_t_T4_COMPRESSION_T6 as i32;
 
-// T.4 supported image widths (bitmask for t30_set_supported_image_sizes)
+// T.4 supported image dimensions (bitmask for t30_set_supported_image_sizes)
 // These are #defines in the C header that bindgen doesn't capture as constants.
-// Values from spandsp/t4_rx.h: T4_SUPPORT_WIDTH_215MM=0x01, 255MM=0x02, 303MM=0x04
+// Values from spandsp/t4_rx.h.
 const T4_SUPPORT_WIDTH_215MM: i32 = 0x01;
 const T4_SUPPORT_WIDTH_255MM: i32 = 0x02;
 const T4_SUPPORT_WIDTH_303MM: i32 = 0x04;
+const T4_SUPPORT_LENGTH_UNLIMITED: i32 = 0x10000;
+const T4_SUPPORT_LENGTH_A4: i32 = 0x20000;
+const T4_SUPPORT_LENGTH_B4: i32 = 0x40000;
+const T4_SUPPORT_LENGTH_US_LETTER: i32 = 0x80000;
+const T4_SUPPORT_LENGTH_US_LEGAL: i32 = 0x100000;
 
-// T.4 supported resolutions (bitmask, OR'd into the same sizes parameter)
-// Values from spandsp/t4_rx.h
+// T.4 bilevel resolutions. These must be passed to
+// t30_set_supported_bilevel_resolutions, not set_supported_image_sizes.
 const T4_RESOLUTION_R8_STANDARD: i32 = 0x01; // 204×98 DPI
 const T4_RESOLUTION_R8_FINE: i32 = 0x02; // 204×196 DPI
 const T4_RESOLUTION_R8_SUPERFINE: i32 = 0x04; // 204×391 DPI
+const T4_RESOLUTION_200_100: i32 = 0x20; // 200×100 DPI
 const T4_RESOLUTION_200_200: i32 = 0x40; // 200×200 DPI
+const T4_RESOLUTION_200_400: i32 = 0x80; // 200×400 DPI
+
+const SUPPORTED_IMAGE_SIZES: i32 = T4_SUPPORT_WIDTH_215MM
+    | T4_SUPPORT_WIDTH_255MM
+    | T4_SUPPORT_WIDTH_303MM
+    | T4_SUPPORT_LENGTH_UNLIMITED
+    | T4_SUPPORT_LENGTH_A4
+    | T4_SUPPORT_LENGTH_B4
+    | T4_SUPPORT_LENGTH_US_LETTER
+    | T4_SUPPORT_LENGTH_US_LEGAL;
+
+const SUPPORTED_BILEVEL_RESOLUTIONS: i32 = T4_RESOLUTION_R8_STANDARD
+    | T4_RESOLUTION_R8_FINE
+    | T4_RESOLUTION_R8_SUPERFINE
+    | T4_RESOLUTION_200_100
+    | T4_RESOLUTION_200_200
+    | T4_RESOLUTION_200_400;
 
 /// Status returned after processing audio
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -98,15 +121,21 @@ fn configure_t30(
     t30.set_supported_compressions(compressions)
         .map_err(spandsp_err!("set_supported_compressions"))?;
 
-    let sizes = T4_SUPPORT_WIDTH_215MM
-        | T4_SUPPORT_WIDTH_255MM
-        | T4_SUPPORT_WIDTH_303MM
-        | T4_RESOLUTION_R8_STANDARD
-        | T4_RESOLUTION_R8_FINE
-        | T4_RESOLUTION_R8_SUPERFINE
-        | T4_RESOLUTION_200_200;
-    t30.set_supported_image_sizes(sizes)
+    t30.set_supported_image_sizes(SUPPORTED_IMAGE_SIZES)
         .map_err(spandsp_err!("set_supported_image_sizes"))?;
+
+    let result = unsafe {
+        spandsp_sys::t30_set_supported_bilevel_resolutions(
+            t30.as_ptr(),
+            SUPPORTED_BILEVEL_RESOLUTIONS,
+        )
+    };
+    if result != 0 {
+        return Err(FaxError::SpanDsp {
+            operation: "set_supported_bilevel_resolutions",
+            detail: format!("SpanDSP error code {result}"),
+        });
+    }
 
     let user_data = callback_state as *mut FaxCallbackState as *mut std::ffi::c_void;
     unsafe {
@@ -302,6 +331,11 @@ impl FaxReceiver {
         self.callback_state.pages_received
     }
 
+    /// Whether SpanDSP has entered T.30 phase B negotiation.
+    pub fn negotiation_started(&self) -> bool {
+        self.callback_state.negotiation_started
+    }
+
     /// Get the output TIFF file path.
     pub fn tiff_output_path(&self) -> &Path {
         &self.tiff_path
@@ -465,6 +499,11 @@ impl FaxT38Receiver {
         self.callback_state.pages_received
     }
 
+    /// Whether SpanDSP has entered T.30 phase B negotiation.
+    pub fn negotiation_started(&self) -> bool {
+        self.callback_state.negotiation_started
+    }
+
     /// Get the output TIFF file path.
     pub fn tiff_output_path(&self) -> &Path {
         &self.tiff_path
@@ -596,6 +635,33 @@ unsafe extern "C" fn spandsp_log_handler(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn image_size_capabilities_include_widths_and_page_lengths() {
+        let widths = T4_SUPPORT_WIDTH_215MM | T4_SUPPORT_WIDTH_255MM | T4_SUPPORT_WIDTH_303MM;
+        let lengths = T4_SUPPORT_LENGTH_UNLIMITED
+            | T4_SUPPORT_LENGTH_A4
+            | T4_SUPPORT_LENGTH_B4
+            | T4_SUPPORT_LENGTH_US_LETTER
+            | T4_SUPPORT_LENGTH_US_LEGAL;
+
+        assert_eq!(SUPPORTED_IMAGE_SIZES & widths, widths);
+        assert_eq!(SUPPORTED_IMAGE_SIZES & lengths, lengths);
+    }
+
+    #[test]
+    fn bilevel_resolutions_are_not_part_of_image_size_mask() {
+        assert_eq!(SUPPORTED_IMAGE_SIZES & 0xff, 0x07);
+        assert_eq!(
+            SUPPORTED_BILEVEL_RESOLUTIONS,
+            T4_RESOLUTION_R8_STANDARD
+                | T4_RESOLUTION_R8_FINE
+                | T4_RESOLUTION_R8_SUPERFINE
+                | T4_RESOLUTION_200_100
+                | T4_RESOLUTION_200_200
+                | T4_RESOLUTION_200_400
+        );
+    }
 
     // check_completion tests
 

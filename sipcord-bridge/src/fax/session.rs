@@ -15,11 +15,55 @@ use crate::services::snowflake::Snowflake;
 use crate::transport::sip::CallId;
 use std::io::Cursor;
 use std::path::PathBuf;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tracing::{debug, error, info, warn};
 
-/// Maximum duration for a fax session before timeout (5 minutes)
-const FAX_TIMEOUT_SECS: u64 = 300;
+/// Maximum time without observable T.30 progress. A completed page, negotiation
+/// start, or advancing decoded row count refreshes this deadline.
+const FAX_INACTIVITY_TIMEOUT_SECS: u64 = 300;
+
+/// Absolute safety limit for a fax session, even while it continues to make
+/// progress. This keeps pathological sessions bounded while allowing normal
+/// multi-page faxes to run well beyond five minutes.
+const FAX_SESSION_LIMIT_SECS: u64 = 30 * 60;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FaxTimeoutReason {
+    Inactive,
+    SessionLimit,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct FaxProgress {
+    negotiation_started: bool,
+    pages_received: u32,
+    image_length: u32,
+}
+
+impl FaxProgress {
+    fn has_advanced_from(self, previous: Self) -> bool {
+        (self.negotiation_started && !previous.negotiation_started)
+            || self.pages_received > previous.pages_received
+            || (self.pages_received == previous.pages_received
+                && self.image_length != previous.image_length)
+    }
+}
+
+fn timeout_reason_at(
+    created_at: Instant,
+    last_progress_at: Instant,
+    now: Instant,
+) -> Option<FaxTimeoutReason> {
+    if now.saturating_duration_since(created_at) >= Duration::from_secs(FAX_SESSION_LIMIT_SECS) {
+        Some(FaxTimeoutReason::SessionLimit)
+    } else if now.saturating_duration_since(last_progress_at)
+        >= Duration::from_secs(FAX_INACTIVITY_TIMEOUT_SECS)
+    {
+        Some(FaxTimeoutReason::Inactive)
+    } else {
+        None
+    }
+}
 
 /// How the fax audio is being received
 pub enum FaxSource {
@@ -70,6 +114,11 @@ pub struct FaxSession {
     pub source: FaxSource,
     /// When this session was created
     pub created_at: Instant,
+    /// Most recent time SpanDSP reported observable fax progress.
+    last_progress_at: Instant,
+    /// Last observed progress marker, used to avoid extending the timeout for
+    /// duplicate packets or timer ticks that do not advance the fax.
+    last_progress: FaxProgress,
     /// Discord poster for this session
     pub poster: DiscordPoster,
     /// SpanDSP fax receiver (audio or T.38 mode)
@@ -119,6 +168,8 @@ impl FaxSession {
 
         let poster = DiscordPoster::new(bot_token, text_channel_id, user_id.clone())?;
 
+        let now = Instant::now();
+
         Ok(Self {
             call_id,
             text_channel_id,
@@ -126,7 +177,9 @@ impl FaxSession {
             user_id,
             state: FaxState::WaitingForData,
             source: FaxSource::G711Audio,
-            created_at: Instant::now(),
+            created_at: now,
+            last_progress_at: now,
+            last_progress: FaxProgress::default(),
             poster,
             receiver: FaxReceiverKind::Audio(receiver),
             tiff_dir,
@@ -139,17 +192,6 @@ impl FaxSession {
     /// Returns true if the fax is complete and ready for post-processing.
     /// Only works in Audio mode — logs a warning and returns false if called in T.38 mode.
     pub fn feed_audio(&mut self, samples: &[i16]) -> bool {
-        // Check for timeout
-        if self.created_at.elapsed().as_secs() > FAX_TIMEOUT_SECS {
-            warn!(
-                "Fax session {} timed out after {}s",
-                self.call_id,
-                self.created_at.elapsed().as_secs()
-            );
-            self.state = FaxState::Failed("Fax reception timed out".to_string());
-            return false;
-        }
-
         if self.is_finished() {
             return matches!(self.state, FaxState::Received | FaxState::Complete);
         }
@@ -247,7 +289,42 @@ impl FaxSession {
         }
 
         let page_count = self.pages_received();
+        let progress = FaxProgress {
+            negotiation_started: self.negotiation_started(),
+            pages_received: page_count,
+            image_length: self
+                .get_stats()
+                .map(|stats| stats.image_length.max(0) as u32)
+                .unwrap_or(0),
+        };
+        self.observe_progress(progress);
         apply_rx_status(&mut self.state, status, page_count)
+    }
+
+    fn negotiation_started(&self) -> bool {
+        match &self.receiver {
+            FaxReceiverKind::Audio(r) => r.negotiation_started(),
+            FaxReceiverKind::T38(r) => r.negotiation_started(),
+        }
+    }
+
+    fn observe_progress(&mut self, progress: FaxProgress) {
+        if progress.has_advanced_from(self.last_progress) {
+            let log_milestone = progress.negotiation_started
+                != self.last_progress.negotiation_started
+                || progress.pages_received != self.last_progress.pages_received;
+            self.last_progress = progress;
+            self.last_progress_at = Instant::now();
+            if log_milestone {
+                debug!(
+                    "Fax {} progress: negotiation={}, pages={}, rows={}",
+                    self.call_id,
+                    progress.negotiation_started,
+                    progress.pages_received,
+                    progress.image_length
+                );
+            }
+        }
     }
 
     /// Number of pages received so far.
@@ -268,7 +345,7 @@ impl FaxSession {
 
     /// Check if this session has timed out
     pub fn is_timed_out(&self) -> bool {
-        self.created_at.elapsed().as_secs() > FAX_TIMEOUT_SECS
+        timeout_reason_at(self.created_at, self.last_progress_at, Instant::now()).is_some()
     }
 
     /// Check if the session is in a terminal state
@@ -358,7 +435,24 @@ impl FaxSession {
             pages
         );
 
-        let gray_images = tiff_decoder::decode_fax_tiff(tiff_path)?;
+        let gray_images = match tiff_decoder::decode_fax_tiff(tiff_path) {
+            Ok(images) => images,
+            Err(error @ FaxError::CorruptPageData(_)) => {
+                warn!(
+                    call_id = %self.call_id,
+                    error = ?error,
+                    "Rejecting corrupt/incomplete fax page data"
+                );
+                let user_message = error.to_string();
+                self.post_failure(&user_message).await;
+
+                // The failure has been reported. Returning Ok prevents the
+                // caller from replacing the specific message with its generic
+                // conversion-failure fallback.
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        };
         let image_pages: Vec<Vec<u8>> = gray_images
             .into_iter()
             .map(|img| {
@@ -428,6 +522,8 @@ impl FaxSession {
         debug!("Fax session {} switching from G.711 to T.38", self.call_id);
         self.source = FaxSource::T38Udptl;
         self.receiver = FaxReceiverKind::T38(t38_receiver);
+        self.last_progress = FaxProgress::default();
+        self.last_progress_at = Instant::now();
     }
 
     /// Generate transmit audio from SpanDSP (CED tones, T.30 signaling).
@@ -574,21 +670,100 @@ mod tests {
         assert!(state_is_finished(&FaxState::Failed("err".to_string())));
     }
 
-    // is_timed_out tests
+    // Timeout policy tests
 
     #[test]
-    fn is_timed_out_fresh() {
-        // A fresh Instant should not be timed out
-        let created_at = Instant::now();
-        let elapsed = created_at.elapsed().as_secs();
-        assert!(elapsed <= FAX_TIMEOUT_SECS);
+    fn fresh_session_is_not_timed_out() {
+        let now = Instant::now();
+        assert_eq!(timeout_reason_at(now, now, now), None);
     }
 
     #[test]
-    fn is_timed_out_old() {
-        // An instant created FAX_TIMEOUT_SECS+1 ago should be timed out
-        let created_at = Instant::now() - std::time::Duration::from_secs(FAX_TIMEOUT_SECS + 1);
-        assert!(created_at.elapsed().as_secs() > FAX_TIMEOUT_SECS);
+    fn inactivity_timeout_fires_at_deadline() {
+        let created_at = Instant::now();
+        let now = created_at + Duration::from_secs(FAX_INACTIVITY_TIMEOUT_SECS);
+        assert_eq!(
+            timeout_reason_at(created_at, created_at, now),
+            Some(FaxTimeoutReason::Inactive)
+        );
+    }
+
+    #[test]
+    fn progress_extends_session_past_old_five_minute_limit() {
+        let created_at = Instant::now();
+        let last_progress_at = created_at + Duration::from_secs(280);
+        let now = created_at + Duration::from_secs(360);
+
+        assert_eq!(timeout_reason_at(created_at, last_progress_at, now), None);
+    }
+
+    #[test]
+    fn progress_does_not_extend_hard_session_limit() {
+        let created_at = Instant::now();
+        let last_progress_at = created_at + Duration::from_secs(FAX_SESSION_LIMIT_SECS - 1);
+        let now = created_at + Duration::from_secs(FAX_SESSION_LIMIT_SECS);
+
+        assert_eq!(
+            timeout_reason_at(created_at, last_progress_at, now),
+            Some(FaxTimeoutReason::SessionLimit)
+        );
+    }
+
+    #[test]
+    fn completed_page_is_progress() {
+        let previous = FaxProgress {
+            negotiation_started: true,
+            pages_received: 1,
+            image_length: 2200,
+        };
+        let current = FaxProgress {
+            negotiation_started: true,
+            pages_received: 2,
+            image_length: 0,
+        };
+
+        assert!(current.has_advanced_from(previous));
+    }
+
+    #[test]
+    fn duplicate_progress_marker_does_not_extend_timeout() {
+        let progress = FaxProgress {
+            negotiation_started: true,
+            pages_received: 1,
+            image_length: 2200,
+        };
+
+        assert!(!progress.has_advanced_from(progress));
+    }
+
+    #[test]
+    fn advancing_rows_is_progress_before_page_completion() {
+        let previous = FaxProgress {
+            negotiation_started: true,
+            pages_received: 0,
+            image_length: 100,
+        };
+        let current = FaxProgress {
+            image_length: 101,
+            ..previous
+        };
+
+        assert!(current.has_advanced_from(previous));
+    }
+
+    #[test]
+    fn row_count_reset_at_page_boundary_is_progress() {
+        let previous = FaxProgress {
+            negotiation_started: true,
+            pages_received: 1,
+            image_length: 2200,
+        };
+        let current = FaxProgress {
+            image_length: 0,
+            ..previous
+        };
+
+        assert!(current.has_advanced_from(previous));
     }
 
     // apply_rx_status tests
