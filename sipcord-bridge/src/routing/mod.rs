@@ -3,6 +3,7 @@ pub mod static_router;
 use crate::services::snowflake::Snowflake;
 use crate::transport::sip::DigestAuthParams;
 use async_trait::async_trait;
+use serde::Serialize;
 
 /// Outbound call request from the backend (e.g., Discord /call command)
 #[derive(Debug, Clone)]
@@ -42,6 +43,55 @@ pub enum OutboundCallStatus {
     Failed(OutboundCallFailureReason),
     NoAudio,
     Ended,
+}
+
+/// Internal diagnostics attached to outbound call status updates.
+///
+/// These values are sent to the private backend for operator troubleshooting;
+/// they must never contain credentials or Discord bot tokens.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct OutboundCallDiagnostics {
+    pub phase: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub elapsed_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub registration: Option<RegistrationDiagnostics>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub leg_failures: Vec<OutboundCallLegFailure>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct RegistrationDiagnostics {
+    pub registrar_sip_users: usize,
+    pub registrar_user_mappings: usize,
+    pub registrar_registrations: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mapped_sip_username: Option<String>,
+    pub target_registration_count: usize,
+    pub target_active_registration_count: usize,
+    pub target_expired_registration_count: usize,
+    pub registrations_truncated: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub registrations: Vec<RegistrationContactDiagnostics>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RegistrationContactDiagnostics {
+    pub contact_uri: String,
+    pub source_addr: String,
+    pub transport: String,
+    pub active: bool,
+    pub registered_age_ms: u64,
+    pub expires_in_ms: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct OutboundCallLegFailure {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sip_call_id: Option<String>,
+    pub detail: String,
 }
 
 /// Result of routing an incoming SIP call
@@ -128,6 +178,16 @@ pub trait Backend: Send + Sync {
 
     /// Report outbound call status back to the backend
     fn report_call_status(&self, call_id: &str, status: OutboundCallStatus);
+
+    /// Report outbound call status with operator-only diagnostic context.
+    fn report_call_status_with_diagnostics(
+        &self,
+        call_id: &str,
+        status: OutboundCallStatus,
+        _diagnostics: OutboundCallDiagnostics,
+    ) {
+        self.report_call_status(call_id, status);
+    }
 
     /// Get the next outbound call command (None if backend doesn't support outbound)
     async fn next_outbound_command(&self) -> Option<OutboundCallCommand>;

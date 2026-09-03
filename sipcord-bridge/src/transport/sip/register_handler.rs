@@ -559,7 +559,15 @@ unsafe fn extract_expires(rdata: *mut pjsip_rx_data) -> u32 {
             return 3600;
         }
 
-        // Try Expires header first
+        // A Contact-level expires parameter overrides the Expires header.
+        // Many phones use only `Contact: <...>;expires=0` to unregister.
+        let contact_hdr = pjsip_msg_find_hdr(msg, pjsip_hdr_e_PJSIP_H_CONTACT, ptr::null_mut())
+            as *const pjsip_contact_hdr;
+        if !contact_hdr.is_null() && (*contact_hdr).expires != u32::MAX {
+            return (*contact_hdr).expires;
+        }
+
+        // Fall back to the request-wide Expires header.
         let expires_hdr = pjsip_msg_find_hdr(msg, pjsip_hdr_e_PJSIP_H_EXPIRES, ptr::null_mut())
             as *const pjsip_expires_hdr;
 

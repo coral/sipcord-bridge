@@ -9,6 +9,8 @@ use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 use tracing::debug;
 
+use crate::routing::{RegistrationContactDiagnostics, RegistrationDiagnostics};
+
 /// Global registrar instance (set during initialization)
 pub static GLOBAL_REGISTRAR: OnceLock<Arc<Registrar>> = OnceLock::new();
 
@@ -69,16 +71,16 @@ impl Registrar {
         // Update or insert into registrations
         let mut regs = self.registrations.entry(sip_username.clone()).or_default();
 
-        // Check if this source_addr already has a registration - update it
-        if let Some(existing) = regs
-            .iter_mut()
-            .find(|r| r.source_addr == reg.source_addr && r.contact_uri == reg.contact_uri)
-        {
+        // A Contact URI identifies a binding. The observed source address is
+        // allowed to change when a NAT mapping is refreshed; requiring both to
+        // match accumulates stale public ports as phantom devices.
+        if let Some(existing) = regs.iter_mut().find(|r| r.contact_uri == reg.contact_uri) {
             let old_user_id = existing.discord_user_id.clone();
 
             existing.expires_at = reg.expires_at;
             existing.registered_at = reg.registered_at;
             existing.contact_uri = reg.contact_uri.clone();
+            existing.source_addr = reg.source_addr;
             existing.discord_user_id = reg.discord_user_id.clone();
             existing.transport = reg.transport;
             let user_changed = old_user_id != existing.discord_user_id;
@@ -97,6 +99,39 @@ impl Registrar {
         drop(regs);
 
         self.user_to_sip.insert(discord_user_id, sip_username);
+    }
+
+    /// Remove one Contact binding, or every binding for the SIP username when
+    /// `contact_uri` is absent (the REGISTER `Contact: *;expires=0` form).
+    /// Returns the number of bindings removed.
+    pub fn remove_registration(&self, sip_username: &str, contact_uri: Option<&str>) -> usize {
+        let Some(mut regs) = self.registrations.get_mut(sip_username) else {
+            return 0;
+        };
+        let user_ids_before: Vec<String> = regs
+            .iter()
+            .map(|registration| registration.discord_user_id.clone())
+            .collect();
+        let before = regs.len();
+        match contact_uri.filter(|contact| !contact.is_empty()) {
+            Some(contact_uri) => {
+                regs.retain(|registration| registration.contact_uri != contact_uri)
+            }
+            None => regs.clear(),
+        }
+        let removed = before - regs.len();
+        let empty = regs.is_empty();
+        drop(regs);
+
+        if empty {
+            self.registrations.remove(sip_username);
+        }
+        if removed > 0 {
+            for user_id in user_ids_before {
+                self.remove_user_mapping_if_unused(&user_id, sip_username);
+            }
+        }
+        removed
     }
 
     /// Remove expired registrations.
@@ -165,6 +200,79 @@ impl Registrar {
         }
     }
 
+    /// Take an operator-facing snapshot of the registrar for a target user.
+    /// Contact URIs and observed source addresses are intentionally included so
+    /// stale NAT bindings and cross-region registration problems can be diagnosed.
+    pub fn diagnostics_for_discord_user_id(
+        &self,
+        discord_user_id: &str,
+    ) -> RegistrationDiagnostics {
+        let now = Instant::now();
+        let mapped_sip_username = self
+            .user_to_sip
+            .get(discord_user_id)
+            .map(|entry| entry.value().clone());
+        let registrar_registrations = self
+            .registrations
+            .iter()
+            .map(|entry| entry.value().len())
+            .sum();
+
+        // Scan the registrations as well as the reverse index. If the index is
+        // ever missing or stale, the snapshot will make that discrepancy visible.
+        let mut registrations: Vec<RegistrationContactDiagnostics> = self
+            .registrations
+            .iter()
+            .flat_map(|entry| {
+                entry
+                    .value()
+                    .iter()
+                    .filter(|registration| registration.discord_user_id == discord_user_id)
+                    .map(|registration| RegistrationContactDiagnostics {
+                        contact_uri: redact_sip_uri_credentials(&registration.contact_uri),
+                        source_addr: registration.source_addr.to_string(),
+                        transport: match registration.transport {
+                            SipTransport::Udp => "udp",
+                            SipTransport::Tcp => "tcp",
+                            SipTransport::Tls => "tls",
+                        }
+                        .to_string(),
+                        active: registration.expires_at > now,
+                        registered_age_ms: duration_ms(
+                            now.saturating_duration_since(registration.registered_at),
+                        ),
+                        expires_in_ms: if registration.expires_at > now {
+                            duration_ms(registration.expires_at.duration_since(now)) as i64
+                        } else {
+                            -(duration_ms(now.duration_since(registration.expires_at)) as i64)
+                        },
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        let target_active_registration_count = registrations
+            .iter()
+            .filter(|registration| registration.active)
+            .count();
+        let target_registration_count = registrations.len();
+        const MAX_DIAGNOSTIC_REGISTRATIONS: usize = 32;
+        let registrations_truncated = target_registration_count > MAX_DIAGNOSTIC_REGISTRATIONS;
+        registrations.truncate(MAX_DIAGNOSTIC_REGISTRATIONS);
+
+        RegistrationDiagnostics {
+            registrar_sip_users: self.registrations.len(),
+            registrar_user_mappings: self.user_to_sip.len(),
+            registrar_registrations,
+            mapped_sip_username,
+            target_registration_count,
+            target_active_registration_count,
+            target_expired_registration_count: target_registration_count
+                - target_active_registration_count,
+            registrations_truncated,
+            registrations,
+        }
+    }
+
     fn remove_user_mapping_if_unused(&self, discord_user_id: &str, sip_username: &str) {
         let still_registered = self
             .registrations
@@ -179,6 +287,32 @@ impl Registrar {
             self.user_to_sip.remove(discord_user_id);
         }
     }
+}
+
+fn duration_ms(duration: Duration) -> u64 {
+    duration.as_millis().min(u64::MAX as u128) as u64
+}
+
+fn redact_sip_uri_credentials(uri: &str) -> String {
+    let lower = uri.to_ascii_lowercase();
+    let Some(scheme_start) = lower.find("sips:").or_else(|| lower.find("sip:")) else {
+        return uri.to_string();
+    };
+    let user_info_start = scheme_start
+        + if lower[scheme_start..].starts_with("sips:") {
+            5
+        } else {
+            4
+        };
+    let Some(at_offset) = uri[user_info_start..].find('@') else {
+        return uri.to_string();
+    };
+    let at = user_info_start + at_offset;
+    let Some(password_separator) = uri[user_info_start..at].find(':') else {
+        return uri.to_string();
+    };
+    let password_start = user_info_start + password_separator + 1;
+    format!("{}[redacted]{}", &uri[..password_start], &uri[at..])
 }
 
 /// Start the periodic cleanup task
@@ -257,7 +391,7 @@ mod tests {
             "sip:alice@1.2.3.4",
             300,
         ));
-        // Same source_addr + contact_uri -> update in place
+        // Same Contact URI -> update in place
         reg.add_registration(make_reg(
             "alice",
             "1001",
@@ -267,6 +401,73 @@ mod tests {
         ));
         let addrs = reg.get_source_addrs_for_sip_user("alice");
         assert_eq!(addrs.len(), 1); // Should not duplicate
+    }
+
+    #[test]
+    fn refresh_updates_nat_source_without_duplicating_contact() {
+        let reg = Registrar::new();
+        reg.add_registration(make_reg(
+            "alice",
+            "1001",
+            "1.2.3.4:5060",
+            "sip:alice@phone.local:5060",
+            300,
+        ));
+        reg.add_registration(make_reg(
+            "alice",
+            "1001",
+            "1.2.3.4:62000",
+            "sip:alice@phone.local:5060",
+            300,
+        ));
+
+        let contacts = reg.get_contacts_for_discord_user_id("1001");
+        assert_eq!(contacts.len(), 1);
+        assert_eq!(
+            contacts[0].1,
+            "1.2.3.4:62000".parse::<SocketAddr>().unwrap()
+        );
+    }
+
+    #[test]
+    fn unregister_removes_every_stale_source_for_contact() {
+        let reg = Registrar::new();
+        // Seed the duplicate state produced by the old source+Contact keying.
+        let contact = "sip:alice@phone.local:5060";
+        let mut registrations = vec![
+            make_reg("alice", "1001", "1.2.3.4:5060", contact, 300),
+            make_reg("alice", "1001", "1.2.3.4:62000", contact, 300),
+        ];
+        reg.registrations
+            .insert("alice".to_string(), std::mem::take(&mut registrations));
+        reg.user_to_sip
+            .insert("1001".to_string(), "alice".to_string());
+
+        assert_eq!(reg.remove_registration("alice", Some(contact)), 2);
+        assert!(reg.get_contacts_for_discord_user_id("1001").is_empty());
+        assert!(!reg.user_to_sip.contains_key("1001"));
+    }
+
+    #[test]
+    fn wildcard_unregister_removes_all_contacts() {
+        let reg = Registrar::new();
+        reg.add_registration(make_reg(
+            "alice",
+            "1001",
+            "1.2.3.4:5060",
+            "sip:alice@phone-a.local",
+            300,
+        ));
+        reg.add_registration(make_reg(
+            "alice",
+            "1001",
+            "5.6.7.8:5060",
+            "sip:alice@phone-b.local",
+            300,
+        ));
+
+        assert_eq!(reg.remove_registration("alice", None), 2);
+        assert!(reg.get_contacts_for_discord_user_id("1001").is_empty());
     }
 
     #[test]
@@ -337,6 +538,69 @@ mod tests {
         let contacts = reg.get_contacts_for_discord_user_id("1003");
         assert_eq!(contacts.len(), 1);
         assert_eq!(contacts[0].0, "sip:charlie@5.6.7.8");
+    }
+
+    #[test]
+    fn diagnostics_include_active_and_expired_contacts() {
+        let reg = Registrar::new();
+        let mut expired = make_reg("charlie", "1003", "1.2.3.4:5060", "sip:charlie@1.2.3.4", 0);
+        expired.expires_at = Instant::now() - Duration::from_secs(1);
+        reg.add_registration(expired);
+        let mut active = make_reg(
+            "charlie",
+            "1003",
+            "5.6.7.8:5061",
+            "sips:charlie@5.6.7.8:5061",
+            300,
+        );
+        active.transport = SipTransport::Tls;
+        reg.add_registration(active);
+
+        let diagnostics = reg.diagnostics_for_discord_user_id("1003");
+        assert_eq!(diagnostics.mapped_sip_username.as_deref(), Some("charlie"));
+        assert_eq!(diagnostics.target_registration_count, 2);
+        assert_eq!(diagnostics.target_active_registration_count, 1);
+        assert_eq!(diagnostics.target_expired_registration_count, 1);
+        assert!(!diagnostics.registrations_truncated);
+        assert!(diagnostics.registrations.iter().any(|contact| {
+            contact.active && contact.transport == "tls" && contact.source_addr == "5.6.7.8:5061"
+        }));
+        assert!(
+            diagnostics
+                .registrations
+                .iter()
+                .any(|contact| { !contact.active && contact.contact_uri == "sip:charlie@1.2.3.4" })
+        );
+    }
+
+    #[test]
+    fn diagnostics_expose_a_missing_reverse_index() {
+        let reg = Registrar::new();
+        reg.add_registration(make_reg(
+            "alice",
+            "1001",
+            "1.2.3.4:5060",
+            "sip:alice@1.2.3.4",
+            300,
+        ));
+        reg.user_to_sip.remove("1001");
+
+        let diagnostics = reg.diagnostics_for_discord_user_id("1001");
+        assert_eq!(diagnostics.mapped_sip_username, None);
+        assert_eq!(diagnostics.target_registration_count, 1);
+        assert_eq!(diagnostics.target_active_registration_count, 1);
+    }
+
+    #[test]
+    fn diagnostics_redact_sip_uri_passwords() {
+        assert_eq!(
+            redact_sip_uri_credentials("<sips:alice:super-secret@example.com:5061;transport=tls>"),
+            "<sips:alice:[redacted]@example.com:5061;transport=tls>"
+        );
+        assert_eq!(
+            redact_sip_uri_credentials("sip:alice@example.com"),
+            "sip:alice@example.com"
+        );
     }
 
     #[test]
