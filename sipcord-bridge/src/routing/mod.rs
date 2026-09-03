@@ -37,6 +37,7 @@ pub enum OutboundCallFailureReason {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OutboundCallStatus {
     Unavailable,
+    Dialing,
     Ringing,
     Answered,
     Connected,

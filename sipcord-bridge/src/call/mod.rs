@@ -1441,6 +1441,25 @@ impl BridgeCoordinator {
                         });
                     }
 
+                    SipEvent::OutboundCallRinging {
+                        tracking_id,
+                        call_id,
+                        status_code,
+                        status_text,
+                    } => {
+                        backend_for_sip.report_call_status_with_diagnostics(
+                            &tracking_id,
+                            OutboundCallStatus::Ringing,
+                            OutboundCallDiagnostics {
+                                phase: "sip_ringing".into(),
+                                detail: Some(format!(
+                                    "SIP leg {call_id} received {status_code} {status_text}"
+                                )),
+                                ..Default::default()
+                            },
+                        );
+                    }
+
                     SipEvent::OutboundCallFailed {
                         tracking_id,
                         call_id: failed_call_id,
@@ -1665,7 +1684,7 @@ impl BridgeCoordinator {
 
                 outbound_backend.report_call_status_with_diagnostics(
                     &req.call_id,
-                    OutboundCallStatus::Ringing,
+                    OutboundCallStatus::Dialing,
                     OutboundCallDiagnostics {
                         phase: "sip_dial".into(),
                         detail: Some(format!("queued {fork_total} outbound SIP leg(s)")),

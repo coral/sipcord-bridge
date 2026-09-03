@@ -54,6 +54,13 @@ pub enum SipEvent {
     /// Call timed out due to RTP inactivity (no audio received for extended period)
     /// rx_count is the total RTP packets received before timeout (0 = never got any audio)
     CallTimeout { call_id: CallId, rx_count: u64 },
+    /// Outbound call received a provisional ringing response
+    OutboundCallRinging {
+        tracking_id: String,
+        call_id: CallId,
+        status_code: i32,
+        status_text: String,
+    },
     /// Outbound call was answered
     OutboundCallAnswered {
         tracking_id: String,

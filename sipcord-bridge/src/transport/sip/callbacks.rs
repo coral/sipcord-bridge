@@ -517,6 +517,10 @@ pub unsafe extern "C" fn on_dtmf_digit_cb(raw_call_id: pjsua_call_id, digit: c_i
     }
 }
 
+fn is_ringing_provisional(status_code: i32) -> bool {
+    (180..200).contains(&status_code)
+}
+
 pub unsafe extern "C" fn on_call_state_cb(raw_call_id: pjsua_call_id, _e: *mut pjsip_event) {
     unsafe {
         let call_id = CallId::new(raw_call_id);
@@ -530,13 +534,28 @@ pub unsafe extern "C" fn on_call_state_cb(raw_call_id: pjsua_call_id, _e: *mut p
         if let Some(tracking_id) = super::get_outbound_tracking_id(call_id) {
             // This is an outbound call (Discord -> SIP)
             if ci.state == pjsip_inv_state_PJSIP_INV_STATE_EARLY {
-                // Ringing (180 Ringing or 183 Session Progress)
-                // Ringing is tracked via ws_client::report_call_status from the bridge coordinator
+                let status_code = ci.last_status as i32;
+                let status_text = pj_str_to_string(&ci.last_status_text);
                 tracing::info!(
-                    "Outbound call {} ringing (tracking_id={})",
+                    "Outbound call {} received provisional response {} {} (tracking_id={})",
                     call_id,
+                    status_code,
+                    status_text,
                     tracking_id
                 );
+                if is_ringing_provisional(status_code)
+                    && let Some(event_tx) = OUTBOUND_EVENT_TX.get()
+                    && event_tx
+                        .send(super::SipEvent::OutboundCallRinging {
+                            tracking_id: tracking_id.clone(),
+                            call_id,
+                            status_code,
+                            status_text,
+                        })
+                        .is_err()
+                {
+                    tracing::error!("Outbound SIP event queue closed while reporting ringing");
+                }
             } else if ci.state == pjsip_inv_state_PJSIP_INV_STATE_CONFIRMED {
                 tracing::info!(
                     "Outbound call {} answered (tracking_id={})",
@@ -1470,6 +1489,16 @@ unsafe fn strip_hold_from_neg_remote(call_id: CallId, rdata: *mut pjsip_rx_data)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_ringing_provisional_responses_advance_the_call() {
+        assert!(!is_ringing_provisional(100));
+        assert!(!is_ringing_provisional(179));
+        assert!(is_ringing_provisional(180));
+        assert!(is_ringing_provisional(183));
+        assert!(is_ringing_provisional(199));
+        assert!(!is_ringing_provisional(200));
+    }
 
     fn t38_offer(
         version: u8,
