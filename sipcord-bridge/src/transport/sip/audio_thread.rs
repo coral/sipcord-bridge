@@ -727,7 +727,7 @@ pub fn check_rtp_inactivity() {
             .collect()
     };
 
-    let mut timed_out_calls: Vec<(CallId, u64)> = Vec::new();
+    let mut timed_out_calls: Vec<(CallId, u64, u64, u64, bool)> = Vec::new();
     let mut updates = Vec::new();
 
     // Now iterate without holding the lock
@@ -735,13 +735,26 @@ pub fn check_rtp_inactivity() {
         let current_rx = match get_call_rtp_rx_count(call_id) {
             Some(count) => count,
             None => {
-                // Call stats unavailable - likely dead call
-                // Don't wait for on_call_state_cb which may never fire
-                tracing::warn!(
-                    "Call {} RTP stats unavailable, treating as timed out",
-                    call_id
-                );
-                timed_out_calls.push((call_id, 0));
+                // PJSIP can briefly make stream statistics unavailable during
+                // media setup or renegotiation. Do not immediately hang up and
+                // mislabel that internal condition as zero RTP from the phone.
+                let elapsed = last_activity.elapsed().as_secs();
+                let timeout = rtp_inactivity_timeout_secs();
+                if elapsed > timeout {
+                    tracing::warn!(
+                        "Call {} RTP stats unavailable for {}s (timeout={}s)",
+                        call_id,
+                        elapsed,
+                        timeout
+                    );
+                    timed_out_calls.push((call_id, last_rx_count, elapsed, timeout, false));
+                } else {
+                    tracing::debug!(
+                        "Call {} RTP stats temporarily unavailable after {}s",
+                        call_id,
+                        elapsed
+                    );
+                }
                 continue;
             }
         };
@@ -765,7 +778,7 @@ pub fn check_rtp_inactivity() {
                     current_rx,
                     timeout
                 );
-                timed_out_calls.push((call_id, current_rx));
+                timed_out_calls.push((call_id, current_rx, elapsed, timeout, true));
             }
         }
     }
@@ -783,7 +796,7 @@ pub fn check_rtp_inactivity() {
         // Remove timed out calls from tracking
         {
             let mut map = activity_map.lock();
-            for &(call_id, _) in &timed_out_calls {
+            for &(call_id, _, _, _, _) in &timed_out_calls {
                 map.remove(&call_id);
             }
         }
@@ -791,8 +804,16 @@ pub fn check_rtp_inactivity() {
         if let Some(sender_lock) = TIMEOUT_EVENT_TX.get()
             && let Some(ref tx) = *sender_lock.lock()
         {
-            for (call_id, rx_count) in timed_out_calls {
-                let _ = tx.send(super::SipEvent::CallTimeout { call_id, rx_count });
+            for (call_id, rx_count, inactive_for_secs, timeout_secs, stats_available) in
+                timed_out_calls
+            {
+                let _ = tx.send(super::SipEvent::CallTimeout {
+                    call_id,
+                    rx_count,
+                    inactive_for_secs,
+                    timeout_secs,
+                    stats_available,
+                });
             }
         }
     }

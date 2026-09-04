@@ -51,9 +51,19 @@ pub enum SipEvent {
     },
     /// Call ended
     CallEnded { call_id: CallId },
-    /// Call timed out due to RTP inactivity (no audio received for extended period)
-    /// rx_count is the total RTP packets received before timeout (0 = never got any audio)
-    CallTimeout { call_id: CallId, rx_count: u64 },
+    /// Call timed out due to RTP inactivity or unavailable RTP statistics.
+    CallTimeout {
+        call_id: CallId,
+        /// Total received RTP packets (0 means none were observed).
+        rx_count: u64,
+        /// How long the bridge observed no RTP progress.
+        inactive_for_secs: u64,
+        /// The configured timeout used for this decision.
+        timeout_secs: u64,
+        /// False when PJSIP stopped exposing stream statistics. This is an
+        /// internal media-state failure, not evidence that the phone sent no RTP.
+        stats_available: bool,
+    },
     /// Outbound call received a provisional ringing response
     OutboundCallRinging {
         tracking_id: String,

@@ -1368,24 +1368,73 @@ impl BridgeCoordinator {
                         }
                     }
 
-                    SipEvent::CallTimeout { call_id, rx_count } => {
+                    SipEvent::CallTimeout {
+                        call_id,
+                        rx_count,
+                        inactive_for_secs,
+                        timeout_secs,
+                        stats_available,
+                    } => {
                         warn!(
-                            "Call {} timed out due to RTP inactivity (rx_count={}), forcing hangup",
-                            call_id, rx_count
+                            "Call {} media timed out (rx_count={}, inactive_for_secs={}, timeout_secs={}, stats_available={}), forcing hangup",
+                            call_id,
+                            rx_count,
+                            inactive_for_secs,
+                            timeout_secs,
+                            stats_available
                         );
 
-                        // If no audio was ever received, report no_audio to the coordinator
-                        // so the Discord embed can show a diagnostic message
-                        if rx_count == 0
-                            && let Some(call_info) = sip_calls.get(&call_id)
+                        if let Some(call_info) = sip_calls.get(&call_id)
                             && let Some(ref tracking_id) = call_info.tracking_id
                         {
-                            info!(
-                                "Call {} had zero RTP packets, reporting no_audio (tracking_id={})",
-                                call_id, tracking_id
-                            );
-                            backend_for_sip
-                                .report_call_status(tracking_id, OutboundCallStatus::NoAudio);
+                            let diagnostics = OutboundCallDiagnostics {
+                                phase: if stats_available {
+                                    "rtp_inactivity".into()
+                                } else {
+                                    "rtp_stats_unavailable".into()
+                                },
+                                detail: Some(if stats_available {
+                                    format!(
+                                        "received {rx_count} RTP packet(s); no packet-count progress for {inactive_for_secs}s (timeout={timeout_secs}s)"
+                                    )
+                                } else {
+                                    format!(
+                                        "PJSIP stream statistics unavailable for {inactive_for_secs}s (timeout={timeout_secs}s, last_rx_count={rx_count})"
+                                    )
+                                }),
+                                elapsed_ms: Some(inactive_for_secs.saturating_mul(1_000)),
+                                ..Default::default()
+                            };
+
+                            if !stats_available {
+                                // This is an internal media-state failure. Never blame the
+                                // endpoint with a no-audio DM when no RTP stats were available.
+                                backend_for_sip.report_call_status_with_diagnostics(
+                                    tracking_id,
+                                    OutboundCallStatus::Failed(
+                                        OutboundCallFailureReason::Internal,
+                                    ),
+                                    diagnostics,
+                                );
+                            } else if rx_count == 0 {
+                                info!(
+                                    "Call {} had zero RTP packets, reporting no_audio (tracking_id={})",
+                                    call_id, tracking_id
+                                );
+                                backend_for_sip.report_call_status_with_diagnostics(
+                                    tracking_id,
+                                    OutboundCallStatus::NoAudio,
+                                    diagnostics,
+                                );
+                            } else {
+                                // The call carried media and later went idle. Report the
+                                // timeout before hangup so its cause survives in D1.
+                                backend_for_sip.report_call_status_with_diagnostics(
+                                    tracking_id,
+                                    OutboundCallStatus::Ended,
+                                    diagnostics,
+                                );
+                            }
                         }
 
                         let _ = sip_cmd_tx.send(SipCommand::Hangup { call_id });
