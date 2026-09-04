@@ -7,10 +7,11 @@
 use super::callbacks::{
     extract_digest_auth_from_rdata, extract_source_ip, extract_user_agent, is_sipvicious_scanner,
 };
+use super::contact::ContactHeaderRef;
 use super::error::SipResponseError;
 use super::ffi::pj_str::respond_stateless_with_headers;
 use super::ffi::types::*;
-use super::ffi::utils::pj_str_to_string;
+use crate::services::registrar::{RegisteredContact, SipTransport};
 use pjsua::*;
 use std::ffi::CStr;
 use std::net::SocketAddr;
@@ -33,17 +34,22 @@ pub struct PendingRegisterTsx {
     pub tsx: SendableTsx,
     pub tdata: SendableTdata,
     pub expires: u32,
-    /// Client's Contact URI, echoed back in the 200 OK per RFC 3261 §10.3.
+    /// Complete Contact value echoed back in the 200 OK per RFC 3261 §10.3.
     /// Strict clients (3CX) treat the response as a forced-unregister when
     /// their binding isn't listed.
-    pub contact_uri: Option<String>,
+    pub contact_value: Option<String>,
+}
+
+struct ParsedRegisterContact {
+    registration: RegisteredContact,
+    response_value: String,
 }
 
 impl std::fmt::Debug for PendingRegisterTsx {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PendingRegisterTsx")
             .field("expires", &self.expires)
-            .field("contact_uri", &self.contact_uri)
+            .field("has_contact", &self.contact_value.is_some())
             .finish()
     }
 }
@@ -97,7 +103,9 @@ fn dispatch_register_request(
                 auth_ok: false,
             });
         } else {
-            tracing::error!("SIP command queue is unavailable; deferred REGISTER cannot be rejected");
+            tracing::error!(
+                "SIP command queue is unavailable; deferred REGISTER cannot be rejected"
+            );
         }
     }
 }
@@ -113,9 +121,7 @@ fn queue_register_request(request: RegisterRequest) {
 /// responses are best-effort from inside an FFI callback.
 unsafe fn send_simple_response(rdata: *mut pjsip_rx_data, status_code: u16, reason: &CStr) {
     unsafe {
-        if let Err(e) =
-            respond_stateless_with_headers(rdata, status_code, Some(reason), &[])
-        {
+        if let Err(e) = respond_stateless_with_headers(rdata, status_code, Some(reason), &[]) {
             tracing::warn!(
                 "Failed to respond {} {:?} to SIP request: {}",
                 status_code,
@@ -135,47 +141,96 @@ unsafe fn send_simple_response(rdata: *mut pjsip_rx_data, status_code: u16, reas
 unsafe fn send_register_ok(
     rdata: *mut pjsip_rx_data,
     expires: u32,
-    contact_uri: Option<&str>,
+    contact_value: Option<&str>,
 ) -> Result<(), SipResponseError> {
     unsafe {
         let expires_str = expires.to_string();
-        let contact_str = contact_uri.map(|uri| format!("<{}>;expires={}", uri, expires));
 
         // Two-header common case
-        if let Some(ref contact) = contact_str {
+        if let Some(contact) = contact_value {
             respond_stateless_with_headers(
                 rdata,
                 200,
                 None,
-                &[(c"Expires", expires_str.as_str()), (c"Contact", contact.as_str())],
+                &[(c"Expires", expires_str.as_str()), (c"Contact", contact)],
             )
         } else {
-            respond_stateless_with_headers(
-                rdata,
-                200,
-                None,
-                &[(c"Expires", expires_str.as_str())],
-            )
+            respond_stateless_with_headers(rdata, 200, None, &[(c"Expires", expires_str.as_str())])
         }
     }
 }
 
 /// Detect transport type (UDP/TCP/TLS) from the incoming request.
-unsafe fn detect_transport(rdata: *mut pjsip_rx_data) -> crate::services::registrar::SipTransport {
+unsafe fn detect_transport(rdata: *mut pjsip_rx_data) -> SipTransport {
     unsafe {
         if !(*rdata).tp_info.transport.is_null() {
             let tp_type = (*(*rdata).tp_info.transport).key.type_ as u32;
-            if tp_type == pjsip_transport_type_e_PJSIP_TRANSPORT_TLS {
-                crate::services::registrar::SipTransport::Tls
-            } else if tp_type == pjsip_transport_type_e_PJSIP_TRANSPORT_TCP {
-                crate::services::registrar::SipTransport::Tcp
+            if tp_type == pjsip_transport_type_e_PJSIP_TRANSPORT_TLS
+                || tp_type == pjsip_transport_type_e_PJSIP_TRANSPORT_TLS6
+            {
+                SipTransport::Tls
+            } else if tp_type == pjsip_transport_type_e_PJSIP_TRANSPORT_TCP
+                || tp_type == pjsip_transport_type_e_PJSIP_TRANSPORT_TCP6
+            {
+                SipTransport::Tcp
             } else {
-                crate::services::registrar::SipTransport::Udp
+                SipTransport::Udp
             }
         } else {
-            crate::services::registrar::SipTransport::Udp
+            SipTransport::Udp
         }
     }
+}
+
+fn needs_symmetric_register_response(
+    transport_type: pjsip_transport_type_e,
+    rport: i32,
+    source_port: i32,
+) -> bool {
+    (transport_type == pjsip_transport_type_e_PJSIP_TRANSPORT_UDP
+        || transport_type == pjsip_transport_type_e_PJSIP_TRANSPORT_UDP6)
+        && rport < 0
+        && source_port > 0
+}
+
+/// Broken UDP phones frequently omit RFC 3581 `rport` while sending from a
+/// translated source port. For REGISTER only, make PJSIP's normal response
+/// machinery use the actual packet source tuple. This happens before both
+/// stateless responses and UAS transaction creation.
+unsafe fn normalize_register_response_route(rdata: *mut pjsip_rx_data) {
+    if rdata.is_null() {
+        return;
+    }
+
+    let transport = unsafe { (*rdata).tp_info.transport };
+    let via = unsafe { (*rdata).msg_info.via };
+    if transport.is_null() || via.is_null() {
+        return;
+    }
+
+    let transport_type = unsafe { (*transport).key.type_ as pjsip_transport_type_e };
+    let source_port = unsafe { (*rdata).pkt_info.src_port };
+    let rport = unsafe { (*via).rport_param };
+    if !needs_symmetric_register_response(transport_type, rport, source_port) {
+        return;
+    }
+
+    let advertised_port = unsafe { (*via).sent_by.port };
+    let ignored_maddr = unsafe { (*via).maddr_param.slen > 0 };
+    unsafe {
+        (*via).rport_param = source_port;
+        // PJSIP gives Via maddr precedence over rport. SIPcord is a unicast
+        // registrar, so a missing-rport REGISTER must not redirect its reply
+        // away from the packet source.
+        (*via).maddr_param.ptr = ptr::null_mut();
+        (*via).maddr_param.slen = 0;
+    }
+    tracing::debug!(
+        source_port,
+        advertised_port,
+        ignored_maddr,
+        "Using symmetric response routing for UDP REGISTER without rport"
+    );
 }
 
 /// Create a UAS transaction + pre-built response tdata for deferred REGISTER
@@ -183,7 +238,7 @@ unsafe fn detect_transport(rdata: *mut pjsip_rx_data) -> crate::services::regist
 unsafe fn create_register_tsx(
     rdata: *mut pjsip_rx_data,
     expires: u32,
-    contact_uri: Option<String>,
+    contact_value: Option<String>,
 ) -> Result<PendingRegisterTsx, SipResponseError> {
     unsafe {
         let endpt = pjsua_get_pjsip_endpt();
@@ -218,7 +273,7 @@ unsafe fn create_register_tsx(
             tsx: SendableTsx(tsx),
             tdata: SendableTdata(tdata),
             expires,
-            contact_uri,
+            contact_value,
         })
     }
 }
@@ -255,6 +310,8 @@ pub unsafe extern "C" fn on_rx_request_cb(rdata: *mut pjsip_rx_data) -> pj_bool_
             return pj_constants__PJ_FALSE as pj_bool_t;
         }
 
+        normalize_register_response_route(rdata);
+
         // Extract source IP for logging and ban checking
         let source_ip = extract_source_ip(rdata);
         let ip_str = source_ip
@@ -262,7 +319,7 @@ pub unsafe extern "C" fn on_rx_request_cb(rdata: *mut pjsip_rx_data) -> pj_bool_
             .unwrap_or_else(|| "unknown".to_string());
 
         // Extract source port
-        let source_port = (*rdata).pkt_info.src_port as u16;
+        let source_port = u16::try_from((*rdata).pkt_info.src_port).unwrap_or_default();
 
         // Ban checks: skip if banning disabled or IP is whitelisted
         if let Some(ip) = source_ip
@@ -340,10 +397,10 @@ pub unsafe extern "C" fn on_rx_request_cb(rdata: *mut pjsip_rx_data) -> pj_bool_
             }
 
             // Extract fields needed for all code paths
-            let contact_uri = extract_contact_uri(rdata);
             let expires = extract_expires(rdata);
             let source_addr = source_ip.map(|ip| SocketAddr::new(ip, source_port));
             let transport = detect_transport(rdata);
+            let contact = extract_registered_contact(rdata, source_addr, transport, expires);
 
             // Auth cache verification
             if let Some(cache) = crate::services::auth_cache::AuthCache::global() {
@@ -356,7 +413,13 @@ pub unsafe extern "C" fn on_rx_request_cb(rdata: *mut pjsip_rx_data) -> pj_bool_
                             params.username,
                             ip_str
                         );
-                        if let Err(e) = send_register_ok(rdata, expires, contact_uri.as_deref()) {
+                        if let Err(e) = send_register_ok(
+                            rdata,
+                            expires,
+                            contact
+                                .as_ref()
+                                .map(|contact| contact.response_value.as_str()),
+                        ) {
                             tracing::warn!(
                                 "REGISTER 200 OK (cached) send failed for {}: {} — strict clients may reject",
                                 params.username,
@@ -366,7 +429,7 @@ pub unsafe extern "C" fn on_rx_request_cb(rdata: *mut pjsip_rx_data) -> pj_bool_
                         // Send to async handler for registrar update
                         queue_register_request(RegisterRequest {
                             digest_auth: params,
-                            contact_uri: contact_uri.unwrap_or_default(),
+                            contact: contact.map(|contact| contact.registration),
                             source_addr,
                             transport,
                             expires,
@@ -386,7 +449,7 @@ pub unsafe extern "C" fn on_rx_request_cb(rdata: *mut pjsip_rx_data) -> pj_bool_
                         // after a password change) and update failure counts
                         queue_register_request(RegisterRequest {
                             digest_auth: params,
-                            contact_uri: contact_uri.unwrap_or_default(),
+                            contact: contact.map(|contact| contact.registration),
                             source_addr,
                             transport,
                             expires,
@@ -403,11 +466,14 @@ pub unsafe extern "C" fn on_rx_request_cb(rdata: *mut pjsip_rx_data) -> pj_bool_
                             params.username,
                             ip_str
                         );
-                        match create_register_tsx(rdata, expires, contact_uri.clone()) {
+                        let response_contact = contact
+                            .as_ref()
+                            .map(|contact| contact.response_value.clone());
+                        match create_register_tsx(rdata, expires, response_contact) {
                             Ok(pending) => {
                                 queue_register_request(RegisterRequest {
                                     digest_auth: params,
-                                    contact_uri: contact_uri.unwrap_or_default(),
+                                    contact: contact.map(|contact| contact.registration),
                                     source_addr,
                                     transport,
                                     expires,
@@ -435,17 +501,19 @@ pub unsafe extern "C" fn on_rx_request_cb(rdata: *mut pjsip_rx_data) -> pj_bool_
                 ip_str,
                 params.username
             );
-            let contact_uri_for_response = contact_uri.clone();
+            let contact_value_for_response = contact
+                .as_ref()
+                .map(|contact| contact.response_value.clone());
             let user_for_log = params.username.clone();
             queue_register_request(RegisterRequest {
                 digest_auth: params,
-                contact_uri: contact_uri.unwrap_or_default(),
+                contact: contact.map(|contact| contact.registration),
                 source_addr,
                 transport,
                 expires,
                 pending_tsx: None,
             });
-            if let Err(e) = send_register_ok(rdata, expires, contact_uri_for_response.as_deref())
+            if let Err(e) = send_register_ok(rdata, expires, contact_value_for_response.as_deref())
             {
                 tracing::warn!(
                     "REGISTER 200 OK (stateless) send failed for {}: {} — strict clients may reject",
@@ -487,8 +555,14 @@ pub unsafe extern "C" fn on_rx_request_cb(rdata: *mut pjsip_rx_data) -> pj_bool_
 
 // Extraction helpers
 
-/// Extract Contact URI from REGISTER request
-unsafe fn extract_contact_uri(rdata: *mut pjsip_rx_data) -> Option<String> {
+/// Parse the first non-wildcard REGISTER Contact into owned data before the
+/// request leaves the PJSIP thread.
+unsafe fn extract_registered_contact(
+    rdata: *mut pjsip_rx_data,
+    source_addr: Option<SocketAddr>,
+    transport: SipTransport,
+    expires: u32,
+) -> Option<ParsedRegisterContact> {
     if rdata.is_null() {
         return None;
     }
@@ -499,51 +573,91 @@ unsafe fn extract_contact_uri(rdata: *mut pjsip_rx_data) -> Option<String> {
             return None;
         }
 
-        let contact_hdr = pjsip_msg_find_hdr(msg, pjsip_hdr_e_PJSIP_H_CONTACT, ptr::null_mut())
-            as *const pjsip_contact_hdr;
-
-        if contact_hdr.is_null() {
-            return None;
-        }
-
-        let uri = (*contact_hdr).uri;
-        if uri.is_null() {
-            return None;
-        }
-
-        // The Contact header URI is typically a pjsip_name_addr wrapping a pjsip_sip_uri.
-        // We must unwrap it via the vtable's p_get_uri (equivalent to pjsip_uri_get_uri()
-        // which is an inline C function not available through FFI).
-        let uri_vptr = (*(uri as *const pjsip_uri)).vptr;
-        if uri_vptr.is_null() {
-            return None;
-        }
-        let get_uri_fn = (*uri_vptr).p_get_uri?;
-        let sip_uri_raw = get_uri_fn(uri as *mut std::os::raw::c_void);
-        if sip_uri_raw.is_null() {
-            return None;
-        }
-        let sip_uri = sip_uri_raw as *const pjsip_sip_uri;
-        if (*sip_uri).host.ptr.is_null() || (*sip_uri).host.slen <= 0 {
-            return None;
-        }
-
-        let host = pj_str_to_string(&(*sip_uri).host);
-        let port = (*sip_uri).port;
-        let user = if !(*sip_uri).user.ptr.is_null() && (*sip_uri).user.slen > 0 {
-            Some(pj_str_to_string(&(*sip_uri).user))
-        } else {
-            None
+        let contact_header = ContactHeaderRef::find(msg)?;
+        let uri = match contact_header.sip_uri() {
+            Ok(Some(uri)) => uri,
+            Ok(None) => return None,
+            Err(error) => {
+                tracing::warn!(%error, "Ignoring malformed REGISTER Contact");
+                return None;
+            }
         };
 
-        let uri_str = match (user, port) {
-            (Some(u), p) if p > 0 => format!("sip:{}@{}:{}", u, host, p),
-            (Some(u), _) => format!("sip:{}@{}", u, host),
-            (None, p) if p > 0 => format!("sip:{}:{}", host, p),
-            (None, _) => format!("sip:{}", host),
+        let legacy_base_uri = uri.legacy_base_uri();
+        let line = uri.parameter("line");
+        let advertised_uri = match uri.print(pjsip_uri_context_e_PJSIP_URI_IN_CONTACT_HDR) {
+            Ok(uri) => uri,
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    contact = %legacy_base_uri,
+                    "Falling back to legacy REGISTER Contact serialization"
+                );
+                legacy_base_uri.clone()
+            }
+        };
+        let response_value = match contact_header.response_value((*rdata).tp_info.pool, expires) {
+            Ok(value) => value,
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    contact = %legacy_base_uri,
+                    "Falling back to URI-only REGISTER Contact response"
+                );
+                format!("<{advertised_uri}>;expires={expires}")
+            }
         };
 
-        Some(uri_str)
+        let callback_uri = source_addr
+            .and_then(|source_addr| {
+                let result = uri.callback_uri((*rdata).tp_info.pool, source_addr, transport);
+                match result {
+                    Ok(callback_uri) => Some(callback_uri),
+                    Err(error) => {
+                        tracing::warn!(
+                            %error,
+                            contact = %legacy_base_uri,
+                            "Falling back to legacy callback URI construction"
+                        );
+                        None
+                    }
+                }
+            })
+            .or_else(|| {
+                source_addr.map(|source_addr| {
+                    build_legacy_callback_uri(&legacy_base_uri, source_addr, transport)
+                })
+            })
+            .unwrap_or_else(|| advertised_uri.clone());
+
+        Some(ParsedRegisterContact {
+            registration: RegisteredContact::new(
+                advertised_uri,
+                legacy_base_uri,
+                line,
+                callback_uri,
+            ),
+            response_value,
+        })
+    }
+}
+
+fn build_legacy_callback_uri(
+    contact_uri: &str,
+    source_addr: SocketAddr,
+    transport: SipTransport,
+) -> String {
+    let user = contact_uri
+        .strip_prefix("sip:")
+        .or_else(|| contact_uri.strip_prefix("sips:"))
+        .and_then(|rest| rest.split_once('@').map(|(user, _)| user));
+    let authority = user
+        .map(|user| format!("{user}@{source_addr}"))
+        .unwrap_or_else(|| source_addr.to_string());
+    match transport {
+        SipTransport::Tls => format!("sips:{authority}"),
+        SipTransport::Tcp => format!("sip:{authority};transport=tcp"),
+        SipTransport::Udp => format!("sip:{authority};transport=udp"),
     }
 }
 
@@ -561,10 +675,10 @@ unsafe fn extract_expires(rdata: *mut pjsip_rx_data) -> u32 {
 
         // A Contact-level expires parameter overrides the Expires header.
         // Many phones use only `Contact: <...>;expires=0` to unregister.
-        let contact_hdr = pjsip_msg_find_hdr(msg, pjsip_hdr_e_PJSIP_H_CONTACT, ptr::null_mut())
-            as *const pjsip_contact_hdr;
-        if !contact_hdr.is_null() && (*contact_hdr).expires != u32::MAX {
-            return (*contact_hdr).expires;
+        if let Some(contact) = ContactHeaderRef::find(msg)
+            && let Some(expires) = contact.expires()
+        {
+            return expires;
         }
 
         // Fall back to the request-wide Expires header.
@@ -586,7 +700,7 @@ unsafe fn extract_expires(rdata: *mut pjsip_rx_data) -> u32 {
 #[derive(Debug)]
 pub struct RegisterRequest {
     pub digest_auth: DigestAuthParams,
-    pub contact_uri: String,
+    pub contact: Option<RegisteredContact>,
     pub source_addr: Option<SocketAddr>,
     pub transport: crate::services::registrar::SipTransport,
     pub expires: u32,
@@ -606,15 +720,20 @@ mod tests {
                 username: "alice".into(),
                 ..DigestAuthParams::default()
             },
-            contact_uri: "sip:alice@phone.local".into(),
+            contact: Some(RegisteredContact::new(
+                "sip:alice@phone.local".into(),
+                "sip:alice@phone.local".into(),
+                None,
+                "sip:alice@203.0.113.5:5060;transport=udp".into(),
+            )),
             source_addr: None,
-            transport: crate::services::registrar::SipTransport::Udp,
+            transport: SipTransport::Udp,
             expires: 300,
             pending_tsx: pending.then_some(PendingRegisterTsx {
                 tsx: SendableTsx(ptr::null_mut()),
                 tdata: SendableTdata(ptr::null_mut()),
                 expires: 300,
-                contact_uri: Some("sip:alice@phone.local".into()),
+                contact_value: Some("<sip:alice@phone.local>;expires=300".into()),
             }),
         }
     }
@@ -638,5 +757,95 @@ mod tests {
             command_rx.try_recv(),
             Ok(super::super::SipCommand::RespondRegister { auth_ok: false, .. })
         ));
+    }
+
+    #[test]
+    fn only_udp_without_rport_uses_symmetric_response_routing() {
+        assert!(needs_symmetric_register_response(
+            pjsip_transport_type_e_PJSIP_TRANSPORT_UDP,
+            -1,
+            51_896,
+        ));
+        assert!(needs_symmetric_register_response(
+            pjsip_transport_type_e_PJSIP_TRANSPORT_UDP6,
+            -1,
+            51_896,
+        ));
+        assert!(!needs_symmetric_register_response(
+            pjsip_transport_type_e_PJSIP_TRANSPORT_UDP,
+            51_896,
+            51_896,
+        ));
+        assert!(!needs_symmetric_register_response(
+            pjsip_transport_type_e_PJSIP_TRANSPORT_TCP,
+            -1,
+            51_896,
+        ));
+        assert!(!needs_symmetric_register_response(
+            pjsip_transport_type_e_PJSIP_TRANSPORT_TLS,
+            -1,
+            51_896,
+        ));
+        assert!(!needs_symmetric_register_response(
+            pjsip_transport_type_e_PJSIP_TRANSPORT_UDP,
+            -1,
+            0,
+        ));
+    }
+
+    #[test]
+    fn symmetric_register_response_uses_packet_port_and_ignores_maddr() {
+        let mut transport: pjsip_transport = unsafe { std::mem::zeroed() };
+        transport.key.type_ = i64::from(pjsip_transport_type_e_PJSIP_TRANSPORT_UDP);
+
+        let mut maddr = b"192.0.2.99".to_vec();
+        let mut via: pjsip_via_hdr = unsafe { std::mem::zeroed() };
+        via.rport_param = -1;
+        via.sent_by.port = 5060;
+        via.maddr_param = pj_str_t {
+            ptr: maddr.as_mut_ptr().cast(),
+            slen: maddr.len() as _,
+        };
+
+        let mut rdata: pjsip_rx_data = unsafe { std::mem::zeroed() };
+        rdata.tp_info.transport = &mut transport;
+        rdata.msg_info.via = &mut via;
+        rdata.pkt_info.src_port = 51_896;
+
+        unsafe { normalize_register_response_route(&mut rdata) };
+
+        assert_eq!(via.rport_param, 51_896);
+        assert!(via.maddr_param.ptr.is_null());
+        assert_eq!(via.maddr_param.slen, 0);
+        assert_eq!(via.sent_by.port, 5060);
+    }
+
+    #[test]
+    fn legacy_callback_uri_keeps_observed_transport_and_source() {
+        let source: SocketAddr = "203.0.113.8:51896".parse().unwrap();
+        assert_eq!(
+            build_legacy_callback_uri(
+                "sip:sipcord-inbound@192.168.1.10:5060",
+                source,
+                SipTransport::Udp
+            ),
+            "sip:sipcord-inbound@203.0.113.8:51896;transport=udp"
+        );
+        assert_eq!(
+            build_legacy_callback_uri(
+                "sip:sipcord-inbound@192.168.1.10:5060",
+                source,
+                SipTransport::Tcp
+            ),
+            "sip:sipcord-inbound@203.0.113.8:51896;transport=tcp"
+        );
+        assert_eq!(
+            build_legacy_callback_uri(
+                "sip:sipcord-inbound@192.168.1.10:5060",
+                source,
+                SipTransport::Tls
+            ),
+            "sips:sipcord-inbound@203.0.113.8:51896"
+        );
     }
 }

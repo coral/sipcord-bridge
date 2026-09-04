@@ -1665,7 +1665,7 @@ impl BridgeCoordinator {
 
                 // Look up the user's SIP contact from the registrar
                 let contacts = if let Some(ref registrar) = outbound_registrar {
-                    registrar.get_contacts_for_discord_user_id(&req.discord_user_id)
+                    registrar.get_callback_uris_for_discord_user_id(&req.discord_user_id)
                 } else {
                     Vec::new()
                 };
@@ -1702,30 +1702,10 @@ impl BridgeCoordinator {
                 );
 
                 // Ring ALL registered contacts simultaneously
-                for (contact_uri, source_addr, transport) in &contacts {
-                    // Extract the user part from the Contact URI (e.g., "sip:3001@10.0.1.151:5060" -> "3001")
-                    // The contact_uri has the correct SIP username/extension; source_addr is the NAT'd public address
-                    let user_part = contact_uri
-                        .strip_prefix("sip:")
-                        .or_else(|| contact_uri.strip_prefix("sips:"))
-                        .and_then(|rest| rest.split('@').next())
-                        .unwrap_or(&req.discord_username);
-
-                    let sip_uri = match transport {
-                        crate::services::registrar::SipTransport::Tls => {
-                            format!("sips:{}@{}", user_part, source_addr)
-                        }
-                        crate::services::registrar::SipTransport::Tcp => {
-                            format!("sip:{}@{};transport=tcp", user_part, source_addr)
-                        }
-                        crate::services::registrar::SipTransport::Udp => {
-                            format!("sip:{}@{};transport=udp", user_part, source_addr)
-                        }
-                    };
-
+                for request_uri in &contacts {
                     let _ = outbound_sip_cmd_tx.send(SipCommand::MakeOutboundCall {
                         tracking_id: req.call_id.clone(),
-                        sip_uri,
+                        sip_uri: request_uri.clone(),
                         caller_display_name: Some(req.caller_username.clone()),
                         fork_total,
                     });

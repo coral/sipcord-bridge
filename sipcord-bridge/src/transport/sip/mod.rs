@@ -3,6 +3,7 @@ pub mod ffi;
 mod audio_thread;
 mod callbacks;
 mod channel_audio;
+mod contact;
 pub mod error;
 pub mod fork_group;
 mod nat;
@@ -502,12 +503,8 @@ fn process_sip_command(
                     }
                     // RFC 3261 §10.3: echo the client's binding back as Contact.
                     // Required for strict clients like 3CX to accept registration.
-                    if let Some(ref uri) = pending.contact_uri
-                        && let Err(e) = append_tdata_hdr(
-                            tdata,
-                            c"Contact",
-                            &format!("<{}>;expires={}", uri, pending.expires),
-                        )
+                    if let Some(ref value) = pending.contact_value
+                        && let Err(e) = append_tdata_hdr(tdata, c"Contact", value)
                     {
                         tracing::warn!(
                             "deferred REGISTER 200 OK: failed to append Contact header ({}); strict clients may reject",

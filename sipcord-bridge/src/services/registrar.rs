@@ -15,11 +15,73 @@ use crate::routing::{RegistrationContactDiagnostics, RegistrationDiagnostics};
 pub static GLOBAL_REGISTRAR: OnceLock<Arc<Registrar>> = OnceLock::new();
 
 /// Transport protocol used for a SIP registration
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SipTransport {
     Udp,
     Tcp,
     Tls,
+}
+
+/// The stable identity used to refresh or remove one Contact binding.
+///
+/// SIPcord historically ignored Contact URI parameters. Retaining that base
+/// identity keeps parameter-churning phones working, while Asterisk's opaque
+/// `line` token is included so multiple outbound registrations do not merge.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RegistrationBindingIdentity {
+    legacy_base_uri: String,
+    line: Option<String>,
+}
+
+/// Parsed data from a REGISTER Contact.
+#[derive(Clone)]
+pub struct RegisteredContact {
+    advertised_uri: String,
+    callback_uri: String,
+    identity: RegistrationBindingIdentity,
+}
+
+impl RegisteredContact {
+    pub(crate) fn new(
+        advertised_uri: String,
+        legacy_base_uri: String,
+        line: Option<String>,
+        callback_uri: String,
+    ) -> Self {
+        Self {
+            advertised_uri,
+            callback_uri,
+            identity: RegistrationBindingIdentity {
+                legacy_base_uri,
+                line,
+            },
+        }
+    }
+
+    pub(crate) fn advertised_uri(&self) -> &str {
+        &self.advertised_uri
+    }
+}
+
+impl std::fmt::Debug for RegisteredContact {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RegisteredContact")
+            .field(
+                "advertised_uri",
+                &redact_sip_uri_credentials(&self.advertised_uri),
+            )
+            .field(
+                "callback_uri",
+                &redact_sip_uri_credentials(&self.callback_uri),
+            )
+            .finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Display for RegisteredContact {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&redact_sip_uri_credentials(&self.advertised_uri))
+    }
 }
 
 /// A single SIP registration (one phone/device)
@@ -29,8 +91,8 @@ pub struct Registration {
     /// Stable Discord user snowflake. Display names are deliberately not used
     /// for routing because they can change while a phone remains registered.
     pub discord_user_id: String,
-    /// From Contact header (client-advertised URI)
-    pub contact_uri: String,
+    /// Advertised Contact, stable binding identity, and NAT-safe callback URI.
+    pub contact: RegisteredContact,
     /// Actual transport source (for NAT traversal)
     pub source_addr: SocketAddr,
     /// Transport protocol used to register
@@ -71,15 +133,18 @@ impl Registrar {
         // Update or insert into registrations
         let mut regs = self.registrations.entry(sip_username.clone()).or_default();
 
-        // A Contact URI identifies a binding. The observed source address is
-        // allowed to change when a NAT mapping is refreshed; requiring both to
-        // match accumulates stale public ports as phantom devices.
-        if let Some(existing) = regs.iter_mut().find(|r| r.contact_uri == reg.contact_uri) {
+        // The compatibility identity ignores incidental URI parameter churn
+        // but includes Asterisk's `line` token. The observed source address is
+        // allowed to change when a NAT mapping is refreshed.
+        if let Some(existing) = regs
+            .iter_mut()
+            .find(|registration| registration.contact.identity == reg.contact.identity)
+        {
             let old_user_id = existing.discord_user_id.clone();
 
             existing.expires_at = reg.expires_at;
             existing.registered_at = reg.registered_at;
-            existing.contact_uri = reg.contact_uri.clone();
+            existing.contact = reg.contact.clone();
             existing.source_addr = reg.source_addr;
             existing.discord_user_id = reg.discord_user_id.clone();
             existing.transport = reg.transport;
@@ -102,9 +167,13 @@ impl Registrar {
     }
 
     /// Remove one Contact binding, or every binding for the SIP username when
-    /// `contact_uri` is absent (the REGISTER `Contact: *;expires=0` form).
+    /// `contact` is absent (the REGISTER `Contact: *;expires=0` form).
     /// Returns the number of bindings removed.
-    pub fn remove_registration(&self, sip_username: &str, contact_uri: Option<&str>) -> usize {
+    pub fn remove_registration(
+        &self,
+        sip_username: &str,
+        contact: Option<&RegisteredContact>,
+    ) -> usize {
         let Some(mut regs) = self.registrations.get_mut(sip_username) else {
             return 0;
         };
@@ -113,9 +182,9 @@ impl Registrar {
             .map(|registration| registration.discord_user_id.clone())
             .collect();
         let before = regs.len();
-        match contact_uri.filter(|contact| !contact.is_empty()) {
-            Some(contact_uri) => {
-                regs.retain(|registration| registration.contact_uri != contact_uri)
+        match contact {
+            Some(contact) => {
+                regs.retain(|registration| registration.contact.identity != contact.identity)
             }
             None => regs.clear(),
         }
@@ -179,7 +248,7 @@ impl Registrar {
         }
     }
 
-    /// Get contacts for a Discord user (for inbound calling)
+    /// Get client-advertised contacts for a Discord user.
     pub fn get_contacts_for_discord_user_id(
         &self,
         discord_user_id: &str,
@@ -194,7 +263,37 @@ impl Registrar {
             Some(regs) => regs
                 .iter()
                 .filter(|r| r.expires_at > now && r.discord_user_id == discord_user_id)
-                .map(|r| (r.contact_uri.clone(), r.source_addr, r.transport))
+                .map(|registration| {
+                    (
+                        registration.contact.advertised_uri.clone(),
+                        registration.source_addr,
+                        registration.transport,
+                    )
+                })
+                .collect(),
+            None => Vec::new(),
+        }
+    }
+
+    /// Get NAT-safe Request-URIs for callback calls to a Discord user.
+    pub(crate) fn get_callback_uris_for_discord_user_id(
+        &self,
+        discord_user_id: &str,
+    ) -> Vec<String> {
+        let sip_username = match self.user_to_sip.get(discord_user_id) {
+            Some(entry) => entry.value().clone(),
+            None => return Vec::new(),
+        };
+
+        let now = Instant::now();
+        match self.registrations.get(&sip_username) {
+            Some(registrations) => registrations
+                .iter()
+                .filter(|registration| {
+                    registration.expires_at > now
+                        && registration.discord_user_id == discord_user_id
+                })
+                .map(|registration| registration.contact.callback_uri.clone())
                 .collect(),
             None => Vec::new(),
         }
@@ -229,7 +328,9 @@ impl Registrar {
                     .iter()
                     .filter(|registration| registration.discord_user_id == discord_user_id)
                     .map(|registration| RegistrationContactDiagnostics {
-                        contact_uri: redact_sip_uri_credentials(&registration.contact_uri),
+                        contact_uri: redact_sip_uri_credentials(
+                            registration.contact.advertised_uri(),
+                        ),
                         source_addr: registration.source_addr.to_string(),
                         transport: match registration.transport {
                             SipTransport::Udp => "udp",
@@ -340,10 +441,38 @@ mod tests {
         contact: &str,
         expires_secs: u64,
     ) -> Registration {
+        make_reg_with_contact(
+            sip_user,
+            discord_user_id,
+            addr,
+            contact,
+            contact,
+            None,
+            contact,
+            expires_secs,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn make_reg_with_contact(
+        sip_user: &str,
+        discord_user_id: &str,
+        addr: &str,
+        advertised_uri: &str,
+        legacy_base_uri: &str,
+        line: Option<&str>,
+        callback_uri: &str,
+        expires_secs: u64,
+    ) -> Registration {
         Registration {
             sip_username: sip_user.to_string(),
             discord_user_id: discord_user_id.to_string(),
-            contact_uri: contact.to_string(),
+            contact: RegisteredContact::new(
+                advertised_uri.to_string(),
+                legacy_base_uri.to_string(),
+                line.map(str::to_string),
+                callback_uri.to_string(),
+            ),
             source_addr: addr.parse::<SocketAddr>().unwrap(),
             transport: SipTransport::Udp,
             expires_at: Instant::now() + Duration::from_secs(expires_secs),
@@ -430,6 +559,126 @@ mod tests {
     }
 
     #[test]
+    fn refresh_ignores_non_line_contact_parameter_churn() {
+        let reg = Registrar::new();
+        let base = "sip:alice@phone.local:5060";
+        reg.add_registration(make_reg_with_contact(
+            "alice",
+            "1001",
+            "1.2.3.4:5060",
+            "sip:alice@phone.local:5060;vendor-state=one",
+            base,
+            None,
+            "sip:alice@1.2.3.4:5060;transport=udp;vendor-state=one",
+            300,
+        ));
+        reg.add_registration(make_reg_with_contact(
+            "alice",
+            "1001",
+            "1.2.3.4:62000",
+            "sip:alice@phone.local:5060;vendor-state=two",
+            base,
+            None,
+            "sip:alice@1.2.3.4:62000;transport=udp;vendor-state=two",
+            300,
+        ));
+
+        let contacts = reg.get_contacts_for_discord_user_id("1001");
+        assert_eq!(contacts.len(), 1);
+        assert_eq!(contacts[0].1, "1.2.3.4:62000".parse().unwrap());
+        assert_eq!(
+            contacts[0].0,
+            "sip:alice@phone.local:5060;vendor-state=two"
+        );
+        let callback_uris = reg.get_callback_uris_for_discord_user_id("1001");
+        assert_eq!(
+            callback_uris[0],
+            "sip:alice@1.2.3.4:62000;transport=udp;vendor-state=two"
+        );
+    }
+
+    #[test]
+    fn refresh_with_same_line_token_updates_nat_callback_without_duplication() {
+        let reg = Registrar::new();
+        let base = "sip:sipcord-inbound@pbx.local:5060";
+        reg.add_registration(make_reg_with_contact(
+            "alice",
+            "1001",
+            "1.2.3.4:51000",
+            "sip:sipcord-inbound@pbx.local:5060;line=opaque",
+            base,
+            Some("opaque"),
+            "sip:sipcord-inbound@1.2.3.4:51000;transport=udp;line=opaque",
+            300,
+        ));
+        reg.add_registration(make_reg_with_contact(
+            "alice",
+            "1001",
+            "1.2.3.4:62000",
+            "sip:sipcord-inbound@pbx.local:5060;line=opaque",
+            base,
+            Some("opaque"),
+            "sip:sipcord-inbound@1.2.3.4:62000;transport=udp;line=opaque",
+            300,
+        ));
+
+        let contacts = reg.get_contacts_for_discord_user_id("1001");
+        assert_eq!(contacts.len(), 1);
+        assert_eq!(contacts[0].1, "1.2.3.4:62000".parse().unwrap());
+        let callback_uris = reg.get_callback_uris_for_discord_user_id("1001");
+        assert_eq!(
+            callback_uris[0],
+            "sip:sipcord-inbound@1.2.3.4:62000;transport=udp;line=opaque"
+        );
+    }
+
+    #[test]
+    fn line_tokens_distinguish_bindings_and_targeted_unregister() {
+        let reg = Registrar::new();
+        let base = "sip:sipcord-inbound@pbx.local:5060";
+        let first = make_reg_with_contact(
+            "alice",
+            "1001",
+            "1.2.3.4:51000",
+            "sip:sipcord-inbound@pbx.local:5060;line=first",
+            base,
+            Some("first"),
+            "sip:sipcord-inbound@1.2.3.4:51000;transport=udp;line=first",
+            300,
+        );
+        let first_contact = first.contact.clone();
+        reg.add_registration(first);
+        reg.add_registration(make_reg_with_contact(
+            "alice",
+            "1001",
+            "1.2.3.4:52000",
+            "sip:sipcord-inbound@pbx.local:5060;line=second",
+            base,
+            Some("second"),
+            "sip:sipcord-inbound@1.2.3.4:52000;transport=udp;line=second",
+            300,
+        ));
+
+        let callback_uris = reg.get_callback_uris_for_discord_user_id("1001");
+        assert_eq!(callback_uris.len(), 2);
+        assert!(
+            callback_uris
+                .iter()
+                .any(|request_uri| request_uri.ends_with(";line=first"))
+        );
+        assert!(
+            callback_uris
+                .iter()
+                .any(|request_uri| request_uri.ends_with(";line=second"))
+        );
+
+        assert_eq!(reg.remove_registration("alice", Some(&first_contact)), 1);
+        let callback_uris = reg.get_callback_uris_for_discord_user_id("1001");
+        assert_eq!(callback_uris.len(), 1);
+        assert!(callback_uris[0].ends_with(";line=second"));
+    }
+
+    #[test]
     fn unregister_removes_every_stale_source_for_contact() {
         let reg = Registrar::new();
         // Seed the duplicate state produced by the old source+Contact keying.
@@ -438,12 +687,16 @@ mod tests {
             make_reg("alice", "1001", "1.2.3.4:5060", contact, 300),
             make_reg("alice", "1001", "1.2.3.4:62000", contact, 300),
         ];
+        let registered_contact = registrations[0].contact.clone();
         reg.registrations
             .insert("alice".to_string(), std::mem::take(&mut registrations));
         reg.user_to_sip
             .insert("1001".to_string(), "alice".to_string());
 
-        assert_eq!(reg.remove_registration("alice", Some(contact)), 2);
+        assert_eq!(
+            reg.remove_registration("alice", Some(&registered_contact)),
+            2
+        );
         assert!(reg.get_contacts_for_discord_user_id("1001").is_empty());
         assert!(!reg.user_to_sip.contains_key("1001"));
     }

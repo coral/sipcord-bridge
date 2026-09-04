@@ -6,12 +6,10 @@
 //! - Far-end NAT fixup (rx path): rewrites private IPs in incoming responses
 //!   to the actual public source IP
 
+use super::contact::ContactHeaderRef;
 use super::ffi::types::*;
-use super::ffi::utils::pj_str_to_string;
 use pjsua::*;
-use std::ffi::CString;
 use std::net::Ipv4Addr;
-use std::os::raw::c_char;
 use std::ptr;
 
 // Private helpers
@@ -182,63 +180,20 @@ unsafe fn extract_dst_ipv4(tdata: *const pjsip_tx_data) -> Option<Ipv4Addr> {
     }
 }
 
-/// Rewrite the Contact header's host and port via pool allocation.
-///
-/// Uses vtable-based URI unwrapping (`p_get_uri`) to safely handle both
-/// bare `pjsip_sip_uri` and `pjsip_name_addr`-wrapped URIs.
-/// Returns `true` if the rewrite succeeded.
+/// Rewrite the first SIP/SIPS Contact header's host and port.
 unsafe fn rewrite_contact_host(
     pool: *mut pj_pool_t,
     msg: *mut pjsip_msg,
     new_host: &str,
     new_port: u16,
 ) -> bool {
-    let contact_hdr =
-        unsafe { pjsip_msg_find_hdr(msg, pjsip_hdr_e_PJSIP_H_CONTACT, ptr::null_mut()) }
-            as *mut pjsip_contact_hdr;
-    if contact_hdr.is_null() {
-        return false;
-    }
-
-    let uri = unsafe { (*contact_hdr).uri };
-    if uri.is_null() {
-        return false;
-    }
-
-    // Unwrap via vtable to handle pjsip_name_addr wrapping
-    let uri_vptr = unsafe { (*(uri as *const pjsip_uri)).vptr };
-    if uri_vptr.is_null() {
-        return false;
-    }
-    let get_uri_fn = match unsafe { (*uri_vptr).p_get_uri } {
-        Some(f) => f,
-        None => return false,
-    };
-    let sip_uri_raw = unsafe { get_uri_fn(uri as *mut std::os::raw::c_void) };
-    if sip_uri_raw.is_null() {
-        return false;
-    }
-    let sip_uri = sip_uri_raw as *mut pjsip_sip_uri;
-    if unsafe { (*sip_uri).host.ptr.is_null() || (*sip_uri).host.slen <= 0 } {
-        return false;
-    }
-
-    let Ok(host_cstr) = CString::new(new_host) else {
+    let Some(contact) = (unsafe { ContactHeaderRef::find(msg) }) else {
         return false;
     };
-    let host_len = new_host.len();
-    let pool_str = unsafe { pj_pool_alloc(pool, host_len + 1) } as *mut c_char;
-    if pool_str.is_null() {
+    let Ok(Some(uri)) = contact.sip_uri() else {
         return false;
-    }
-
-    unsafe {
-        ptr::copy_nonoverlapping(host_cstr.as_ptr(), pool_str, host_len + 1);
-        (*sip_uri).host.ptr = pool_str;
-        (*sip_uri).host.slen = host_len as i64;
-        (*sip_uri).port = new_port as i32;
-    }
-    true
+    };
+    uri.rewrite_host(pool, new_host, new_port).is_ok()
 }
 
 /// Replace `old_ip` with `new_ip` inside the SDP body of `msg`, allocating
@@ -379,38 +334,13 @@ unsafe fn rewrite_private_contact_for_external(tdata: *mut pjsip_tx_data, direct
         return false;
     }
 
-    // Find Contact header
-    let contact_hdr =
-        unsafe { pjsip_msg_find_hdr(msg, pjsip_hdr_e_PJSIP_H_CONTACT, ptr::null_mut()) }
-            as *mut pjsip_contact_hdr;
-    if contact_hdr.is_null() {
+    let Some(contact) = (unsafe { ContactHeaderRef::find(msg) }) else {
         return false;
-    }
-
-    let uri = unsafe { (*contact_hdr).uri };
-    if uri.is_null() {
-        return false;
-    }
-
-    // Unwrap via vtable to handle pjsip_name_addr wrapping
-    let uri_vptr = unsafe { (*(uri as *const pjsip_uri)).vptr };
-    if uri_vptr.is_null() {
-        return false;
-    }
-    let get_uri_fn = match unsafe { (*uri_vptr).p_get_uri } {
-        Some(f) => f,
-        None => return false,
     };
-    let sip_uri_raw = unsafe { get_uri_fn(uri as *mut std::os::raw::c_void) };
-    if sip_uri_raw.is_null() {
+    let Ok(Some(uri)) = contact.sip_uri() else {
         return false;
-    }
-    let sip_uri = sip_uri_raw as *mut pjsip_sip_uri;
-    if unsafe { (*sip_uri).host.ptr.is_null() || (*sip_uri).host.slen <= 0 } {
-        return false;
-    }
-
-    let host = unsafe { pj_str_to_string(&(*sip_uri).host) };
+    };
+    let host = uri.host();
 
     // Only rewrite if Contact host is a private (RFC 1918) IP
     let contact_ip: Ipv4Addr = match host.parse() {
@@ -430,7 +360,10 @@ unsafe fn rewrite_private_contact_for_external(tdata: *mut pjsip_tx_data, direct
     }
 
     // Rewrite Contact to public host
-    if unsafe { rewrite_contact_host((*tdata).pool, msg, public_host, *port) } {
+    if uri
+        .rewrite_host(unsafe { (*tdata).pool }, public_host, *port)
+        .is_ok()
+    {
         tracing::debug!(
             "Rewrote {} Contact for external client: {} -> {}:{}",
             direction,
@@ -580,54 +513,24 @@ pub unsafe extern "C" fn on_rx_request_nat_fixup_cb(rdata: *mut pjsip_rx_data) -
         }
     }
 
-    // Also rewrite Contact header if present and has private IP
-    let contact_hdr =
-        unsafe { pjsip_msg_find_hdr(msg, pjsip_hdr_e_PJSIP_H_CONTACT, ptr::null_mut()) }
-            as *mut pjsip_contact_hdr;
-    if !contact_hdr.is_null() {
-        let uri = unsafe { (*contact_hdr).uri };
-        if !uri.is_null() {
-            let uri_vptr = unsafe { (*(uri as *const pjsip_uri)).vptr };
-            if !uri_vptr.is_null()
-                && let Some(get_uri_fn) = unsafe { (*uri_vptr).p_get_uri }
-            {
-                let sip_uri_raw = unsafe { get_uri_fn(uri as *mut std::os::raw::c_void) };
-                if !sip_uri_raw.is_null() {
-                    let sip_uri = sip_uri_raw as *mut pjsip_sip_uri;
-                    let contact_host = unsafe { pj_str_to_string(&(*sip_uri).host) };
-                    if let Ok(contact_ip) = contact_host.parse::<Ipv4Addr>()
-                        && is_rfc1918(contact_ip)
-                        && contact_ip != src_ip
-                    {
-                        let src_port = unsafe { (*rdata).pkt_info.src_port } as u16;
-                        let pool = unsafe { (*rdata).tp_info.pool };
-                        if !pool.is_null()
-                            && let Ok(new_host_cstr) = CString::new(src_ip_str)
-                        {
-                            let host_len = src_ip_str.len();
-                            let pool_str =
-                                unsafe { pj_pool_alloc(pool, host_len + 1) } as *mut c_char;
-                            if !pool_str.is_null() {
-                                unsafe {
-                                    ptr::copy_nonoverlapping(
-                                        new_host_cstr.as_ptr(),
-                                        pool_str,
-                                        host_len + 1,
-                                    );
-                                    (*sip_uri).host.ptr = pool_str;
-                                    (*sip_uri).host.slen = host_len as i64;
-                                    (*sip_uri).port = src_port as i32;
-                                }
-                                tracing::debug!(
-                                    "NAT fixup (INVITE): Contact rewritten {} -> {}:{}",
-                                    contact_host,
-                                    src_ip_str,
-                                    src_port
-                                );
-                            }
-                        }
-                    }
-                }
+    // Also rewrite Contact header if present and has private IP.
+    if let Some(contact) = unsafe { ContactHeaderRef::find(msg) }
+        && let Ok(Some(uri)) = contact.sip_uri()
+    {
+        let contact_host = uri.host();
+        if let Ok(contact_ip) = contact_host.parse::<Ipv4Addr>()
+            && is_rfc1918(contact_ip)
+            && contact_ip != src_ip
+        {
+            let src_port = unsafe { (*rdata).pkt_info.src_port } as u16;
+            let pool = unsafe { (*rdata).tp_info.pool };
+            if uri.rewrite_host(pool, src_ip_str, src_port).is_ok() {
+                tracing::debug!(
+                    "NAT fixup (INVITE): Contact rewritten {} -> {}:{}",
+                    contact_host,
+                    src_ip_str,
+                    src_port
+                );
             }
         }
     }
@@ -711,38 +614,15 @@ pub unsafe extern "C" fn on_rx_response_nat_fixup_cb(rdata: *mut pjsip_rx_data) 
     };
     let src_port = unsafe { (*rdata).pkt_info.src_port } as u16;
 
-    // Find Contact header in the response
-    let contact_hdr =
-        unsafe { pjsip_msg_find_hdr(msg, pjsip_hdr_e_PJSIP_H_CONTACT, ptr::null_mut()) }
-            as *mut pjsip_contact_hdr;
-    if contact_hdr.is_null() {
+    let Some(contact) = (unsafe { ContactHeaderRef::find(msg) }) else {
         return pj_constants__PJ_FALSE as pj_bool_t;
-    }
-
-    // Get the SIP URI from the Contact (unwrap name_addr via vtable).
-    // The rx path requires vtable-based URI unwrapping (p_get_uri) because
-    // the Contact URI may be wrapped in a pjsip_name_addr, unlike the tx
-    // path where we can cast directly.
-    let uri = unsafe { (*contact_hdr).uri };
-    if uri.is_null() {
-        return pj_constants__PJ_FALSE as pj_bool_t;
-    }
-    let uri_vptr = unsafe { (*(uri as *const pjsip_uri)).vptr };
-    if uri_vptr.is_null() {
-        return pj_constants__PJ_FALSE as pj_bool_t;
-    }
-    let get_uri_fn = match unsafe { (*uri_vptr).p_get_uri } {
-        Some(f) => f,
-        None => return pj_constants__PJ_FALSE as pj_bool_t,
     };
-    let sip_uri_raw = unsafe { get_uri_fn(uri as *mut std::os::raw::c_void) };
-    if sip_uri_raw.is_null() {
+    let Ok(Some(uri)) = contact.sip_uri() else {
         return pj_constants__PJ_FALSE as pj_bool_t;
-    }
-    let sip_uri = sip_uri_raw as *mut pjsip_sip_uri;
+    };
 
     // Parse Contact host as IPv4
-    let contact_host = unsafe { pj_str_to_string(&(*sip_uri).host) };
+    let contact_host = uri.host();
     let contact_ip: Ipv4Addr = match contact_host.parse() {
         Ok(ip) => ip,
         Err(_) => return pj_constants__PJ_FALSE as pj_bool_t, // Hostname, skip
@@ -766,20 +646,7 @@ pub unsafe extern "C" fn on_rx_response_nat_fixup_cb(rdata: *mut pjsip_rx_data) 
 
     // Rewrite Contact URI host to the public source IP
     let pool = unsafe { (*rdata).tp_info.pool };
-    if !pool.is_null()
-        && let Ok(new_host_cstr) = CString::new(src_ip_str)
-    {
-        let host_len = src_ip_str.len();
-        let pool_str = unsafe { pj_pool_alloc(pool, host_len + 1) } as *mut c_char;
-        if !pool_str.is_null() {
-            unsafe {
-                ptr::copy_nonoverlapping(new_host_cstr.as_ptr(), pool_str, host_len + 1);
-                (*sip_uri).host.ptr = pool_str;
-                (*sip_uri).host.slen = host_len as i64;
-                (*sip_uri).port = src_port as i32;
-            }
-        }
-    }
+    let _ = uri.rewrite_host(pool, src_ip_str, src_port);
 
     // Rewrite SDP body: replace private IP with public source IP.
     // Parse the SDP c= line directly to get the actual media IP -- it may differ
