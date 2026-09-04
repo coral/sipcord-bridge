@@ -8,6 +8,9 @@ repository = "https://github.com/coral/sipcord-bridge"
 homepage = "https://sipcord.net/"
 publish = false
 
+[package.metadata.release]
+shared-version = "sipcord"
+
 [[bin]]
 name = "sipcord-bridge"
 path = "src/main.rs"

@@ -5,6 +5,9 @@ edition = "2024"
 description = "Rust bindings for pjsua (pjproject SIP library)"
 publish = false
 
+[package.metadata.release]
+tag-name = "pjsua-v{{version}}"
+
 [dependencies]
 
 [build-dependencies]
