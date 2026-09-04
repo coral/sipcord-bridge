@@ -2634,7 +2634,7 @@ checksum = "8b870d8c151b6f2fb93e84a13146138f05d02ed11c7e7c54f8826aaaf7c9f184"
 
 [[package]]
 name = "pjsua"
-version = "2.1.8"
+version = "2.1.9"
 dependencies = [
  "bindgen 0.71.1",
  "cmake",
@@ -3747,7 +3747,7 @@ checksum = "e3a9fe34e3e7a50316060351f37187a3f546bce95496156754b601a5fa71b76e"
 
 [[package]]
 name = "sipcord-bridge"
-version = "2.1.8"
+version = "2.1.9"
 dependencies = [
  "async-trait",
  "audioadapter",
