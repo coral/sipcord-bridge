@@ -74,7 +74,7 @@ Create a `docker-compose.yml`:
 ```yaml
 services:
   sipcord-bridge:
-    image: ghcr.io/coral/sipcord-bridge:latest
+    image: ghcr.io/coral/sipcord:latest
     container_name: sipcord-bridge
     restart: always
     ulimits:

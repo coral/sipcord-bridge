@@ -106,6 +106,9 @@ RUN cargo build --release -p sipcord-bridge
 # Stage 4: Minimal runtime image
 FROM debian:trixie-slim
 
+RUN groupadd sipcord && \
+    useradd -g sipcord -s /sbin/nologin -M sipcord
+
 RUN apt-get update && apt-get install -y \
     ca-certificates \
     libasound2 \
@@ -120,8 +123,9 @@ RUN apt-get update && apt-get install -y \
 
 WORKDIR /app
 
-COPY --from=builder /build/target/release/sipcord-bridge /app/sipcord-bridge
-COPY --from=builder /build/config.toml /app/config.toml
-COPY --from=builder /build/wav/ /app/wav/
+COPY --chown=sipcord:sipcord --from=builder /build/target/release/sipcord-bridge /app/sipcord-bridge
+COPY --chown=sipcord:sipcord --from=builder /build/config.toml /app/config.toml
+COPY --chown=sipcord:sipcord --from=builder /build/wav/ /app/wav/
 
+USER sipcord:sipcord
 ENTRYPOINT ["/app/sipcord-bridge"]
